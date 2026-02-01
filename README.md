@@ -37,9 +37,9 @@ python many_dog_walk_vectorized.py
 
 ---
 
-## To visualize / play the result:
+## Playback
 
-run:
+To visualize / play the result, run:
 ```bash
 python play_many_dog.py --num_envs 4
 python play_many_dog.py --num_envs 16
