@@ -35,4 +35,14 @@ To start the training process, run:
 ```bash
 python many_dog_walk_vectorized.py
 
+---
+
+## To visualize / play the result:
+
+run:
+```bash
+python play_many_dog.py --num_envs 4
+python play_many_dog.py --num_envs 16
+python play_many_dog.py --num_envs 64 
+
 
