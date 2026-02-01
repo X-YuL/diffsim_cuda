@@ -28,16 +28,11 @@ It should be compatible with similar PyTorch/CUDA versions.
 
 ---
 
-## Installation
+## Training
 
-> If your project has dependencies, list them here.  
-> For example, create a venv/conda env and install requirements.
+To start the training process, run:
 
 ```bash
-# (optional) create env
-python -m venv .venv
-source .venv/bin/activate
+python many_dog_walk_vectorized.py
 
-# (optional) install deps
-pip install -r requirements.txt
 
