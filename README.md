@@ -32,7 +32,7 @@ It should be compatible with similar PyTorch/CUDA versions.
 
 To start the training process, run:
 
-```bash
+```bash```
 python many_dog_walk_vectorized.py
 
 ---
@@ -41,7 +41,7 @@ python many_dog_walk_vectorized.py
 
 To visualize / play the result, run:
 
-```bash
+```bash```
 python play_many_dog.py --num_envs 4
 python play_many_dog.py --num_envs 16
 python play_many_dog.py --num_envs 64 
