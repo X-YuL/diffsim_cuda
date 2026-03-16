@@ -294,31 +294,26 @@ class EnvCfg:
     
     # 随机步频开关 - True 开； False 关（固定 step_freq）
     rand_step_freq: bool = False       # True: sample step_freq_B on reset/reset_envs; False: use constant step_freq
-    step_freq_min: float = 1.4        # 1.4
-    step_freq_max: float = 3.2         #3.2
+    step_freq_min: float = 1.0     # 1.4
+    step_freq_max: float = 4.0      #3.2
     
     # 步频随速度u开关 - True 开； False 关（固定 step_freq_B = 2.2）
-    step_freq_from_cmd: bool = True  # True: override step_freq_B each step from |vx_star|
+    step_freq_from_cmd: bool = False  # True: override step_freq_B each step from |vx_star|
     
     # Raibert 参数
     #swing_height: float =  0.012        #固定抬腿高度 ： 0.025
-    #k_raibert: float = 0.55
-    #x_bias: float = 0
+    k_raibert: float = 0
+    x_bias: float = 0.0
     # 训练前期建议：抬脚高一点 + touchdown 反馈小一点（否则很容易把落脚点推到腿够不到的位置）.03          # 额外前移落脚偏置（m）
     swing_height: float = 0.025
+    # ✅ (新增) 用于 _update_gait_from_cmd 的 swing height 上限；必须 >= swing_height
+    swing_height_max: float = 0.05
 
-    
-
-    k_raibert: float = 0.12
     raibert_fb_clip: float = 0.15       # m，touchdown 反馈项每轴限幅
-    x_bias: float = 0.0                # 额外前移落脚偏置（m）
 
     # 训练 warm-up：先禁用腾空段，等学稳了再打开（bound/gallop/running-trot）
     train_no_aerial: bool = True
-    
-    # ✅ (新增) 用于 _update_gait_from_cmd 的 swing height 上限；必须 >= swing_height
-    swing_height_max: float = 0.05
- 
+
     # gait selection 开关：
     # -1: 每个 env 随机一个步态（stand / trot / pace / bound / gallop）
     #  0: stand
@@ -340,11 +335,16 @@ class EnvCfg:
 
     # SRBD params
     
+    """
     m: float = 12.0
     Ixx: float = 0.25
     Iyy: float = 0.90
     Izz: float = 1.00
-
+    """
+    m: float = 7.0       # 接近 URDF 的 6.921
+    Ixx: float = 0.024
+    Iyy: float = 0.098
+    Izz: float = 0.107
 
 
     alpha_align: float = 0.9
@@ -355,11 +355,12 @@ class EnvCfg:
 
     #============================================
     # 随机速度指令 开关 - True 开； False 关（固定 0.2 m/s）
-    rand_cmd: bool = True       # True: sample cmd_B on reset/reset_envs; False: use constant cmd
+    rand_cmd: bool = False       # True: sample cmd_B on reset/reset_envs; False: use constant cmd
     # trot/pace    0.5 - 1 m/s
     # bound/gallop 1 - 2 m/s
-    vx_min: float = +0.5   #0.5
-    vx_max: float = +1.0   #1.0
+    # 提高速度命令：之前 0.1-0.3 太慢，Raibert 落脚点位移太小
+    vx_min: float = +0.4   # 提高最小速度
+    vx_max: float = +0.8   # 提高最大速度
     # 侧向速度、偏航角速度命令范围（默认全 0，你以后想让狗学横移 / 转弯再改）
     vy_min: float = 0
     vy_max: float = 0
@@ -382,6 +383,18 @@ class EnvCfg:
     contact_on_n: float  = 20.0
     contact_off_n: float = 10.0
 
+    #delta_q_scale12 = (0.08, 0.35, 0.45) * 4
+    #delta_q_scale12 = (0.08, 0.25, 0.35) * 4
+    #delta_q_scale12 = (0.15, 0.50, 0.70) * 4
+    # 课程学习：使用中等动作空间
+    #delta_q_scale12 = (0.10, 0.35, 0.50) * 4
+    #delta_q_scale12 = (0.10, 0.30, 0.30) * 4
+    #delta_q_scale12 = (0.10, 0.20, 0.20) * 4
+    delta_q_scale12 = (0.10, 0.30, 0.30) * 4
+    #delta_q_scale12 = (0.05, 0.15, 0.20) * 4
+    
+    
+
 # ========= Real quadruped Isaac Gym env (multi robot) =========
 class RealQuadEnv:
     def __init__(self, cfg: EnvCfg, device="cuda" if torch.cuda.is_available() else "cpu"):
@@ -392,7 +405,7 @@ class RealQuadEnv:
         self.B = int(cfg.num_envs)  # 并行机器狗数量
 
         self._render_cnt = 0
-        self.render_every = 1   # 10~50 都可以试试
+        self.render_every = 10 # 10~50 都可以试试
 
         # ★ 高层速度命令：cmd_rand = [vx_cmd, vy_cmd, yaw_rate_cmd]
         self.cmd_rand = torch.zeros(self.B, 3, device=self.device)   # (B,3)
@@ -440,13 +453,13 @@ class RealQuadEnv:
         ], dtype=np.float32)
         """
 
+        
         self.q_default_np = np.array([
              0.0, 0.86, -1.40,
             -0.0, 0.86, -1.40,
              0.0, 0.86, -1.40,
             -0.0, 0.86, -1.40,
         ], dtype=np.float32)
-        
         
         
 
@@ -929,7 +942,7 @@ class RealQuadEnv:
             vy_rand  = torch.empty(self.B, device=dev).uniform_(self.cfg.vy_min, self.cfg.vy_max)
             yaw_rand = torch.empty(self.B, device=dev).uniform_(self.cfg.yaw_min, self.cfg.yaw_max)
         else:
-            vx_rand  = torch.full((self.B,), 1.0,  device=dev)  # 论文里固定 0.2 m/s 的简单任务
+            vx_rand  = torch.full((self.B,), 0.5,  device=dev)  # 论文里固定 0.2 m/s 的简单任务
             vy_rand  = torch.zeros(self.B, device=dev)
             yaw_rand = torch.zeros(self.B, device=dev)
 
@@ -1126,7 +1139,7 @@ class RealQuadEnv:
             vy_rand  = torch.empty(env_ids.numel(), device=dev).uniform_(self.cfg.vy_min,  self.cfg.vy_max)
             yaw_rand = torch.empty(env_ids.numel(), device=dev).uniform_(self.cfg.yaw_min, self.cfg.yaw_max)
         else:
-            vx_rand  = torch.full((env_ids.numel(),), 1.0, device=dev)
+            vx_rand  = torch.full((env_ids.numel(),), 0.5, device=dev)
             vy_rand  = torch.zeros(env_ids.numel(), device=dev)
             yaw_rand = torch.zeros(env_ids.numel(), device=dev)
 
@@ -1202,7 +1215,8 @@ class RealQuadEnv:
             p_foot0 = self.foot_positions()[0, :, 0:2].detach()
             self._stride_last_td_xy0[:] = p_foot0
 
-    #此公式专门用来推导 步频 以及 抬腿高度 -> 通过 速度指令 以及 "固定步长" 来更新步频 f 
+    
+    #此代码块 通过 速度指令 推导 1.步频 以及 2.抬腿高度 以及 3.相位是否推进  
     def _update_gait_from_cmd(self):
         """
         固定步长 + 频率跟随速度指令（批量 B 版）
@@ -1247,18 +1261,8 @@ class RealQuadEnv:
         # -------- 固定步长表：这里的 L_land 是 “hip 到落脚点” 的前向距离（m）--------
         # 你可以按自己观感改；这些值在 0.06~0.09m 比较好用（对应 stride 约 2*L_land 的量级）
         L_table = torch.tensor(
-            #[0.0, 0.065, 0.065, 0.075, 0.085],  # stand, trot, pace, bound, gallop
-            #[0.0, 0.080, 0.065, 0.075, 0.085],  # stand, trot, pace, bound, gallop
-            #[0.0, 0.10, 0.065, 0.075, 0.085],
-            #[0.0, 0.12, 0.020, 0.075, 0.085],
-            #[0.0, 0.08, 0.080, 0.075, 0.075],
-            #[0.0, 0.08, 0.12, 0.075, 0.075],   #0.12
-
-            #[0.0, 0.125, 0.065, 0.055, 0.085],   # 已经调好的版本
+            #[0.0, 0.08, 0.065, 0.055, 0.085],   # 已经调好的版本
             [0.0, 0.08, 0.065, 0.055, 0.085],   #0.12
-            
-            
-            
             dtype=torch.float32, device=dev
         )
         L_land = L_table[gait_ids].clamp(min=1e-3)  # (B,)
@@ -1364,6 +1368,8 @@ class RealQuadEnv:
         # 世界系速度 / 角速度
         self.base_lin_world = base[:, 7:10]                # (B,3)
         self.base_ang_world = base[:, 10:13]               # (B,3)
+        
+
 
         # 机体系速度 / 角速度
         base_lin_body = []
@@ -1473,15 +1479,19 @@ class RealQuadEnv:
         return J_feet
 
 
-    # ---------------- swing trajectory ----------------
-    # 二次抛物线插值
+    # ---------------- swing trajectory (已经放弃使用的版本)----------------
+    #————————————————————————————————————————————————————————————————————————————————————————————————————————————————--
+    #————————————————————————————————————————————————————————————————————————————————————————————————————————————————--
+    #对于足端轨迹公式以及落脚点公式：已经放弃使用的函数是： swing_ref_traj & _swing_parabola & _raibert_footholds_body
+
+    # 二次抛物线插值 - 之前使用的足端轨迹抛物线函数，但是现在已经放弃使用
     def _swing_parabola(self, p0, pm, p1, s):
         c = p0
         b = 4*(pm - (p0 + p1)/2.0)
         a = p1 - p0 - b
         return a*(s**2) + b*s + c
 
-    # 生成摆动腿参考轨迹 
+    # 生成摆动腿参考轨迹  - 早期使用的摆动轨迹函数，但是现在已经放弃使用
     def swing_ref_traj(self, phases, p_foot_now):
         """
         严格 duty-factor 版摆动轨迹（batch）
@@ -1528,6 +1538,90 @@ class RealQuadEnv:
         pref[..., 2] = pref_xz[..., 1]
         return pref
     
+    #落脚点计算（机体系 Raibert 版本） - 对照论文的，在swing_ref_traj 中使用
+    def _raibert_footholds_body(self, T_stance):
+        """
+        纯机体系版本的 Raibert 落脚点（batch）
+        返回:
+            p_hip_xy_world : (B,4,2)
+            p_land_xy_world: (B,4,2)
+        """
+        dev = self.device
+        B = self.B
+
+        # ===== 把 T_stance 统一成 (B,1) 方便广播 =====
+        if not torch.is_tensor(T_stance):
+            T = torch.full((B, 1), float(T_stance), device=dev)
+        else:
+            T = T_stance.to(dev)
+            if T.dim() == 0:
+                T = T.view(1, 1).expand(B, 1)
+            elif T.dim() == 1:
+                assert T.shape[0] == B, f"T_stance.shape[0]={T.shape[0]} != B={B}"
+                T = T.view(B, 1)
+            else:
+                raise ValueError(f"Unexpected T_stance shape: {T.shape}")
+
+        # yaw (B,)
+        qw, qx, qy, qz = (self.base_quat[:, 0], self.base_quat[:, 1],
+                          self.base_quat[:, 2], self.base_quat[:, 3])
+        siny_cosp = 2.0 * (qw*qz + qx*qy)
+        cosy_cosp = 1.0 - 2.0 * (qy*qy + qz*qz)
+        yaw = torch.atan2(siny_cosp, cosy_cosp)
+
+        cy = torch.cos(yaw)
+        sy = torch.sin(yaw)
+        R_yaw = torch.stack([
+            torch.stack([cy, -sy], dim=-1),
+            torch.stack([sy,  cy], dim=-1)
+        ], dim=1)  # (B,2,2)
+
+        hip_offsets_body = torch.tensor([
+            [ +0.1934, +0.1420 ],
+            [ +0.1934, -0.1420 ],
+            [ -0.1934, +0.1420 ],
+            [ -0.1934, -0.1420 ],
+        ], dtype=torch.float32, device=dev).view(1,4,2).expand(B,4,2)
+
+        base_xy = self.base_pos[:, 0:2]
+
+        # ---- ✅ 命令速度：优先用 cmd_rand 的 vx,vy（机体系）----
+        if hasattr(self, "cmd_rand"):
+            v_cmd_body_xy = self.cmd_rand[:, 0:2]  # (B,2)
+        else:
+            vx_star = self.vx_star
+            v_cmd_body_xy = torch.stack([vx_star, torch.zeros_like(vx_star)], dim=-1)
+        v_body_xy = self.base_lin_body[:, 0:2]  # (B,2)
+
+        if self.cfg.use_paper_raibert:
+            # Raibert: p_land = p_hip + 0.5*T_stance*v_des
+            delta_body = 0.5 * T * v_cmd_body_xy
+        else:
+            forward_B = 0.5 * T * v_cmd_body_xy
+            v_err_xy  = v_body_xy - v_cmd_body_xy
+            fbk_B     = -self.cfg.k_raibert * v_err_xy
+            x_bias_B  = torch.stack([
+                torch.full((B,), self.cfg.x_bias, device=dev),
+                torch.zeros(B, device=dev)
+            ], dim=-1)
+            delta_body = forward_B + fbk_B + x_bias_B
+
+        p_hip_xy_body  = hip_offsets_body
+        p_land_xy_body = p_hip_xy_body + delta_body.unsqueeze(1)
+
+        # body -> world
+        p_hip_xy_world  = base_xy.unsqueeze(1) + torch.matmul(p_hip_xy_body,  R_yaw.transpose(1,2))
+        p_land_xy_world = base_xy.unsqueeze(1) + torch.matmul(p_land_xy_body, R_yaw.transpose(1,2))
+
+        return p_hip_xy_world, p_land_xy_world
+    
+    #————————————————————————————————————————————————————————————————————————————————————————————————————————————————--
+    #————————————————————————————————————————————————————————————————————————————————————————————————————————————————--
+
+
+
+    # ---------------- swing trajectory (现在使用的版本)----------------
+    # 根据速度指令以及步太相位，计算足端目标位置  - 相当于足端轨迹生成的主函数
     def _update_foot_targets_from_command(self, phases, p_foot_now, return_vref: bool = False):
         """
         严格图 9.2/9.3：stance/swing 由 duty factor β 定义；running/bound/gallop 允许腾空段
@@ -1707,6 +1801,7 @@ class RealQuadEnv:
             return p_foot_target, stance_mask, v_foot_ref_world
         return p_foot_target, stance_mask
     
+    # 落脚点计算（机体系 Raibert 版本） - 对照教材的，在 _update_foot_targets_from_command 中使用 ： 现在使用的落脚点公式
     def _raibert_touchdown_world(self, phases: torch.Tensor):
         """
         严格对齐教材/图 9.6/9.7 的 touchdown：
@@ -1749,7 +1844,9 @@ class RealQuadEnv:
         ], dtype=torch.float32, device=dev).view(1,4,2).expand(B,4,2)
 
         base_xy = self.base_pos[:, 0:2]                          # (B,2)
+        
         p_hip_xy_world = base_xy.view(B,1,2) + torch.matmul(hip_offsets_body, R_yaw.transpose(1,2))  # (B,4,2)
+        
 
         # v_des: cmd in body -> world
         if hasattr(self, "cmd_rand"):
@@ -1762,12 +1859,15 @@ class RealQuadEnv:
         v_now_world = self.base_lin_world[:, 0:2]                # (B,2)
 
         term_predict = v_now_world.view(B,1,2) * T_left.unsqueeze(-1)                 # v*(1-p)T_swing
-        term_ff      = 0.5 * v_des_world.view(B,1,2) * T_stance.view(B,1,1)           # 0.5*T_stance*v_des
-        #term_fb      = cfg.k_raibert * (v_now_world - v_des_world).view(B,1,2)        # +k*(v - v_des)
-        term_fb      = cfg.k_raibert * (v_now_world - v_des_world).view(B,1,2)        # +k*(v - v_des)
+
+        #term_ff      = 0.5 * v_des_world.view(B,1,2) * T_stance.view(B,1,1)           # 0.5*T_stance*v_des
+        term_ff      = 0.5 * v_des_world.view(B,1,2) * T_stance.view(B,1,1) 
+
+        # 反馈项：当 v_now < v_des 时，落脚点应该往前（正方向），才能产生更大推力
+        # 所以用 (v_des - v_now)，这样速度不够时 term_fb 为正
+        term_fb      = cfg.k_raibert * (v_des_world - v_now_world).view(B,1,2)        # +k*(v_des - v_now)
         fb_clip = float(getattr(cfg, "raibert_fb_clip", 0.15))
         term_fb = term_fb.clamp(min=-fb_clip, max=+fb_clip)
-
 
         # x_bias along body forward projected to world
         fwd_world = torch.stack([cy, sy], dim=1)                 # (B,2)
@@ -1776,83 +1876,6 @@ class RealQuadEnv:
         p_land_xy_world = p_hip_xy_world  + term_ff 
         return p_hip_xy_world, p_land_xy_world
 
-
-    #落脚点计算（机体系 Raibert 版本）
-    def _raibert_footholds_body(self, T_stance):
-        """
-        纯机体系版本的 Raibert 落脚点（batch）
-        返回:
-            p_hip_xy_world : (B,4,2)
-            p_land_xy_world: (B,4,2)
-        """
-        dev = self.device
-        B = self.B
-
-        # ===== 把 T_stance 统一成 (B,1) 方便广播 =====
-        if not torch.is_tensor(T_stance):
-            T = torch.full((B, 1), float(T_stance), device=dev)
-        else:
-            T = T_stance.to(dev)
-            if T.dim() == 0:
-                T = T.view(1, 1).expand(B, 1)
-            elif T.dim() == 1:
-                assert T.shape[0] == B, f"T_stance.shape[0]={T.shape[0]} != B={B}"
-                T = T.view(B, 1)
-            else:
-                raise ValueError(f"Unexpected T_stance shape: {T.shape}")
-
-        # yaw (B,)
-        qw, qx, qy, qz = (self.base_quat[:, 0], self.base_quat[:, 1],
-                          self.base_quat[:, 2], self.base_quat[:, 3])
-        siny_cosp = 2.0 * (qw*qz + qx*qy)
-        cosy_cosp = 1.0 - 2.0 * (qy*qy + qz*qz)
-        yaw = torch.atan2(siny_cosp, cosy_cosp)
-
-        cy = torch.cos(yaw)
-        sy = torch.sin(yaw)
-        R_yaw = torch.stack([
-            torch.stack([cy, -sy], dim=-1),
-            torch.stack([sy,  cy], dim=-1)
-        ], dim=1)  # (B,2,2)
-
-        hip_offsets_body = torch.tensor([
-            [ +0.1934, +0.1420 ],
-            [ +0.1934, -0.1420 ],
-            [ -0.1934, +0.1420 ],
-            [ -0.1934, -0.1420 ],
-        ], dtype=torch.float32, device=dev).view(1,4,2).expand(B,4,2)
-
-        base_xy = self.base_pos[:, 0:2]
-
-        # ---- ✅ 命令速度：优先用 cmd_rand 的 vx,vy（机体系）----
-        if hasattr(self, "cmd_rand"):
-            v_cmd_body_xy = self.cmd_rand[:, 0:2]  # (B,2)
-        else:
-            vx_star = self.vx_star
-            v_cmd_body_xy = torch.stack([vx_star, torch.zeros_like(vx_star)], dim=-1)
-        v_body_xy = self.base_lin_body[:, 0:2]  # (B,2)
-
-        if self.cfg.use_paper_raibert:
-            # Raibert: p_land = p_hip + 0.5*T_stance*v_des
-            delta_body = 0.5 * T * v_cmd_body_xy
-        else:
-            forward_B = 0.5 * T * v_cmd_body_xy
-            v_err_xy  = v_body_xy - v_cmd_body_xy
-            fbk_B     = -self.cfg.k_raibert * v_err_xy
-            x_bias_B  = torch.stack([
-                torch.full((B,), self.cfg.x_bias, device=dev),
-                torch.zeros(B, device=dev)
-            ], dim=-1)
-            delta_body = forward_B + fbk_B + x_bias_B
-
-        p_hip_xy_body  = hip_offsets_body
-        p_land_xy_body = p_hip_xy_body + delta_body.unsqueeze(1)
-
-        # body -> world
-        p_hip_xy_world  = base_xy.unsqueeze(1) + torch.matmul(p_hip_xy_body,  R_yaw.transpose(1,2))
-        p_land_xy_world = base_xy.unsqueeze(1) + torch.matmul(p_land_xy_body, R_yaw.transpose(1,2))
-
-        return p_hip_xy_world, p_land_xy_world
     
     # ---------------- stance helpers ----------------
     def _phase_u(self, phases: torch.Tensor) -> torch.Tensor:
@@ -1919,6 +1942,7 @@ class RealQuadEnv:
         min_feet_B = torch.where(allow_aerial, torch.zeros_like(min_feet_B), min_feet_B)
         return beta_B, min_feet_B, allow_aerial
     
+    # 根据 phase & β 计算 stance_mask（严格版）:判断当前腿是 stance 还是 swing
     def _stance_phase_mask(self, phases: torch.Tensor, beta_B: torch.Tensor) -> torch.Tensor:
         """
         严格 duty-factor 定义：
@@ -1931,6 +1955,7 @@ class RealQuadEnv:
         u = self._phase_u(phases)                       # (B,4)
         beta = beta_B.view(B, 1)                        # (B,1)
         return (u < beta).float().unsqueeze(-1)         # (B,4,1)
+        
     
 
     def _mix_stance(self,
@@ -2004,7 +2029,8 @@ class RealQuadEnv:
             S = torch.clamp(S, min=1e-3)
             Ainv = U @ torch.diag_embed(1.0/S) @ Vh
             y = Ainv @ rhs
-            f_b = y.view(4,3)
+            #f_b = y.view(4,3)
+            f_b = -y.view(4,3)
 
             # 摩擦锥 + Fz 限幅
             fz = f_b[:, 2:3]
@@ -2036,6 +2062,7 @@ class RealQuadEnv:
             w_list.append(w_b)
         self.srbd_w = torch.stack(w_list, dim=0)       # (B,3)
 
+    # 把 四元数归一化到单位长度
     def _quat_norm(self, q):
         if q.dim() == 1:
             return q / (q.norm() + 1e-9)
@@ -2176,9 +2203,19 @@ class RealQuadEnv:
             phase_offsets = self.leg_phase_offsets.view(1, 4).repeat(B, 1)
         phases = phase_offsets + self.phase.view(B, 1)  # (B,4)
 
+        # -------- 用和足端规划一致的 stance 定义（β duty factor），别再用 sin<0 --------
+        #beta_B, min_feet_B, _ = self._get_beta_minfeet_allow_aerial()          # (B,), (B,)
+        #stance_mask = self._stance_phase_mask(phases, beta_B).squeeze(-1)      # (B,4) in {0,1}
+
         # 整周期扫掠（推进相关），以及仅 swing 的抬腿（清障相关）
+        # 相当于把 相位 映射成两个"周期信号", 一个是 s_full 用作前后扫掠 / 推进的调制
+        # 另一个是 s_swing 用作仅 swing 期的抬腿调制（swing 期为正，stance 期为0）-> 仅用于摆腿期 抬腿/清障的调制 
         s_full  = torch.sin(phases)                      # (B,4) in [-1,1]
         s_swing = torch.clamp(s_full, min=0.0)           # (B,4) in [0,1]
+        #s_swing = torch.clamp(torch.sin(phases), min=0.0) * (1.0 - stance_mask)
+
+        
+
 
         # -------- 速度 & deadzone --------
         if hasattr(self, "cmd_rand"):
@@ -2211,8 +2248,10 @@ class RealQuadEnv:
         # stand=0；trot/pace 适中；bound/gallop 更大
         #th_sweep_tbl：每种 gait 的 thigh（大腿关节）“扫掠/摆动”幅度表（单位 rad）。
         #ca_sweep_tbl：每种 gait 的 calf（小腿关节）“扫掠/摆动”幅度表（单位 rad）。
-        th_sweep_tbl = torch.tensor([0.00, 0.16, 0.12, 0.22, 0.24], device=dev) #0.18 pace目前最稳定的
-        ca_sweep_tbl = torch.tensor([0.00, 0.45, 0.25, 0.38, 0.42], device=dev) #0.25 pace目前最稳定的
+        #th_sweep_tbl = torch.tensor([0.00, 0.16, 0.12, 0.22, 0.24], device=dev) #0.18 pace目前最稳定的
+        #ca_sweep_tbl = torch.tensor([0.00, 0.45, 0.25, 0.38, 0.42], device=dev) #0.25 pace目前最稳定的
+        th_sweep_tbl = torch.tensor([0.00, 0.20, 0.12, 0.22, 0.24], device=dev)
+        ca_sweep_tbl = torch.tensor([0.00, 0.55, 0.25, 0.38, 0.42], device=dev)
         
 
         # 抬腿幅度：整体减小一档
@@ -2231,9 +2270,8 @@ class RealQuadEnv:
         ca_sweep = ca_sweep_tbl[gait_ids] * amp_scale * sweep_scale   # (B,)
         th_lift  = th_lift_tbl[gait_ids]  * amp_scale * lift_scale    # (B,)
         ca_lift  = ca_lift_tbl[gait_ids]  * amp_scale * lift_scale    # (B,)
-
         hip_abd  = hip_abd_tbl[gait_ids]  * amp_scale * hipab_scale   # (B,)
-        
+    
         
         #---------------------------------------------------------------------
         # 新增的部分：
@@ -2266,23 +2304,21 @@ class RealQuadEnv:
 
         # 1) thigh/calf：整周期扫掠（推进） + swing 抬腿（清障）
         # thigh idx=1, calf idx=2
-        """
-        q_ref_all[:, :, 1] += th_sweep.view(B, 1) * s_full + th_lift.view(B, 1) * s_swing
-        q_ref_all[:, :, 2] -= ca_sweep.view(B, 1) * s_full + ca_lift.view(B, 1) * s_swing
-4) 如果 /mujoco/lowcmd 也在变，但 MuJoCo 里还是不动：就查 “执行” 侧
-这时问题通常是这几类（按高概率排序）：
-
-A. mujoco_simulator 没把 lowcmd 写进 data.ctrl（或写错索引）
-在 mujoco_simulator 里加两条打印（只在变化时打印最好）：
-
-打印你写进 MuJoCo 的 ctrl 前 3 个
-
-
-        """
     
 
-        q_ref_all[:, :, 1] += th_sweep.view(B, 1) * s_full_scaled  + th_lift.view(B, 1)  * s_swing_scaled
-        q_ref_all[:, :, 2] -= ca_sweep.view(B, 1) * s_full_scaled  + ca_lift.view(B, 1)  * s_swing_scaled
+        #q_ref_all[:, :, 1] += th_sweep.view(B, 1) * s_full_scaled  + th_lift.view(B, 1)  * s_swing_scaled
+        #q_ref_all[:, :, 2] -= ca_sweep.view(B, 1) * s_full_scaled  + ca_lift.view(B, 1)  * s_swing_scaled
+        # ============ 大腿主扫掠 + 小腿清障（推荐）============
+        # thigh：主推进（整周期扫掠） + swing 期抬腿
+        q_ref_all[:, :, 1] += th_sweep.view(B, 1) * s_full_scaled \
+                      + th_lift.view(B, 1) * s_swing_scaled
+
+        # calf：默认不做整周期扫掠，只在 swing 期“屈膝收腿”用于清障/抬脚
+        # 说明：你这里 knee 的符号习惯是 “swing 时用 -= ca_lift 让 q3 更负”，
+        # 通常更负意味着更屈膝（腿缩短、足端更容易抬高）——保持这个约定即可。
+        calf_sweep_ratio = float(getattr(cfg, "calf_sweep_ratio", 0.00))  # 0.0=纯清障；可设 0.05~0.15 微量参与推进
+        q_ref_all[:, :, 2] -= (ca_sweep.view(B, 1) * calf_sweep_ratio) * s_full_scaled \
+                               + ca_lift.view(B, 1) * s_swing_scaled
         
         
         # 2) hip：swing 期做一点外展/内收（左右交替），增强清障与姿态稳定
@@ -2313,7 +2349,12 @@ A. mujoco_simulator 没把 lowcmd 写进 data.ctrl（或写错索引）
         q_nom   = self._raibert_qref()     # (B,12)
         #q_nom = torch.as_tensor(self.q_default_np, device=self.device).view(1, 12).repeat(self.B, 1)  # (B,12)
         #delta_q = torch.tanh(delta_q) * 0.20
-        delta_q = torch.tanh(delta_q) * 0.10
+        #delta_q = torch.tanh(delta_q) * 0.10
+        
+        scale12 = torch.as_tensor(self.cfg.delta_q_scale12, device=self.device, dtype=torch.float32).view(1, 12)
+        ctrl_sign12 = self.ctrl_sign.view(1,12).to(self.device)   # (1,12)  ±1
+        delta_q = torch.tanh(delta_q) * scale12
+        
 
         #---------------------------------------
         # stop env 判定
@@ -2324,11 +2365,16 @@ A. mujoco_simulator 没把 lowcmd 写进 data.ctrl（或写错索引）
         delta_q = torch.where(stop_env[:, None], torch.zeros_like(delta_q), delta_q)
         #---------------------------------------
 
-        q_ref12 = q_nom + delta_q          # (B,12)
+        q_default = torch.as_tensor(self.q_default_np, device=self.device).view(1,12).repeat(self.B,1)
+
+        q_ref12 = q_default + delta_q
+        
+        #q_ref12 = q_nom + delta_q          # (B,12)
 
         # 目标关节
         target_slice = self.local_targets.clone()   # (B,dof)
-        target_slice[:, self.ctrl_idx_t] = q_ref12 * self.ctrl_sign   # (B,12)
+        #target_slice[:, self.ctrl_idx_t] = q_ref12 * self.ctrl_sign   # (B,12)
+        target_slice[:, self.ctrl_idx_t] = q_ref12 * ctrl_sign12   # policy -> sim 12 个关节 DOF 的目标位置
 
         # 限幅 & 限位 & 变化率
         target_slice = torch.max(torch.min(target_slice, self._hi_slice), self._lo_slice)
@@ -2350,6 +2396,28 @@ A. mujoco_simulator 没把 lowcmd 写进 data.ctrl（或写错索引）
                     self.gym.destroy_viewer(self.viewer); self.viewer = None
 
         self._update_cache()
+
+        # ===== debug: world vs body 速度/位置方向（env0）=====
+        if self.t % 200 == 0:
+            # pos: world frame
+            px = float(self.base_pos[0, 0].item())
+            py = float(self.base_pos[0, 1].item())
+
+            # v_world: world frame（如果你没有 base_lin_world，就用 base_lin - 看你缓存变量名）
+            if hasattr(self, "base_lin_world"):
+                vwx = float(self.base_lin_world[0, 0].item())
+                vwy = float(self.base_lin_world[0, 1].item())
+            else:
+                vwx = float(self.base_lin[0, 0].item())
+                vwy = float(self.base_lin[0, 1].item())
+            # v_body: body frame
+            vbx = float(self.base_lin_body[0, 0].item())
+            vby = float(self.base_lin_body[0, 1].item())
+
+            print(f"[DBG_DIR t={self.t:05d}] pos_w=({px:+.3f},{py:+.3f}) "
+                  f"v_w=({vwx:+.3f},{vwy:+.3f}) v_b=({vbx:+.3f},{vby:+.3f})")
+
+
 
         # 更新每条腿最近接触地面的高度
         with torch.no_grad():
@@ -2525,7 +2593,11 @@ A. mujoco_simulator 没把 lowcmd 写进 data.ctrl（或写错索引）
             "q_err_norm": torch.zeros(self.B, device=self.device),
         }
         q_now12 = self.q[:, self.ctrl_idx_t]                   # (B,12)
-        q_err = q_ref12 - q_now12
+        #q_err = q_ref12 - q_now12
+        q_now_sim = self.q[:, self.ctrl_idx_t]                      # sim
+        q_now_pol = q_now_sim * ctrl_sign12                         # sim -> policy
+        q_err = q_ref12 - q_now_pol                                 # policy - policy ✅
+
         return obs, extra, q_err, q_ref12
 
     @torch.no_grad()
@@ -2558,7 +2630,7 @@ A. mujoco_simulator 没把 lowcmd 写进 data.ctrl（或写错索引）
 
         sincos = torch.stack([torch.sin(phases), torch.cos(phases)], dim=2).reshape(B, 8)
 
-        v_b = self.base_lin_body                             # (B,3)
+        v_b = self.base_lin_body                             # (B,3)的 rollout 循环里、每一步 _srbd_step() 之后那段 “strict alpha align”。位置非常明确：你先用 SRBD 做 forward 更新，然后立刻把 SRBD 状态用 I
         q_wxyz = self.base_quat                              # (B,4)
         w_b  = self.base_ang_body                            # (B,3)
 
@@ -2568,9 +2640,17 @@ A. mujoco_simulator 没把 lowcmd 写进 data.ctrl（或写错索引）
             g_list.append(project_gravity_to_body(q_wxyz[b], cfg.g, dev))
         g_proj = torch.stack(g_list, dim=0)
 
-        q_now12 = self.q[:, self.ctrl_idx_t].to(dev)         # (B,12)
-        q_default = torch.from_numpy(self.q_default_np).to(dev).view(1,12)
-        q_delta = (q_now12 - q_default * self.ctrl_sign.view(1,12))      # (B,12)
+        #q_now12 = self.q[:, self.ctrl_idx_t].to(dev)         # (B,12)
+        #q_default = torch.from_numpy(self.q_default_np).to(dev).view(1,12)
+        #q_delta = (q_now12 - q_default * self.ctrl_sign.view(1,12))      # (B,12)
+
+        q_now_sim = self.q[:, self.ctrl_idx_t].to(dev)      # sim convention
+        ctrl_sign12 = self.ctrl_sign.view(1,12).to(dev)
+
+        q_now_pol = q_now_sim * ctrl_sign12                 # -> policy convention
+        q_default_pol = torch.from_numpy(self.q_default_np).to(dev).view(1,12)
+
+        q_delta = q_now_pol - q_default_pol                 # 这才是论文的 (q - q_default)
 
         # 总维度：3(cmd) + 8(phase) + 3(v_b) + 4(q) + 3(w_b) + 12(q_delta) + 3(g_proj) = 36
         obs = torch.cat([cmd, sincos, v_b, q_wxyz, w_b, q_delta, g_proj], dim=-1)  # (B,36)
@@ -2585,29 +2665,61 @@ def train(num_iters=1000, steps_per_iter=24,
     set_seed(seed)
 
     cfg = EnvCfg()
-    cfg.trot_style = "walk"   # or "normal" / "run"
-    cfg.rand_cmd = True          # ✅ 开启随机速度指令
-    cfg.vx_min = +0.5         # 你可以改成论文的命令范围
-    cfg.vx_max = +1.0
+    cfg.trot_style = "normal"   # or "normal" / "run"
+    cfg.rand_cmd = False          # ✅ 开启随机速度指令
+    cfg.vx_min = +0.4        # 你可以改成论文的命令范围
+    cfg.vx_max = +0.5
     cfg.train_no_aerial = True
 
-
+  
     if PURE_PAPER_MODE:
         cfg.use_paper_raibert = True 
-
+     
     env = RealQuadEnv(cfg, device=device)
     B = env.B
     model = Policy(dim_obs=36, dim_action=12).to(device)
-    opt = AdamW(model.parameters(), lr=1e-3)
+    opt = AdamW(model.parameters(), lr=1e-3)  # 进一步降低学习率
+    #调整学习率可以加快收敛，但是go2貌似动作幅度很大
+    #1e-3 -> 速度在-0.5 到 0.5之间
+    #1e-4 -> 速度在-0.3 到 0.3之间
 
+
+    
     # 主损失 Eq.(5) 各项权重
-    a1, a2, a3, a4, a5, a6 = 0.5, 0.5, 0.5, 0.5, 0.5, 0.5
+    #a1, a2, a3, a4, a5, a6 = 5, 0.5, 0.5, 0.01, 0.5, 0.5
+    #a1, a2, a3, a4, a5, a6 = 10, 1.0, 0.5, 0.05, 1.0, 0.5
+    #a1, a2, a3, a4, a5, a6 = 20, 1.0, 0.5, 0.05, 1.0, 0.5
+    # a1=loss_v, a2=loss_h, a3=loss_omega, a4=loss_ctrl, a5=loss_gproj, a6=loss_foot
     
-    
+    #a1, a2, a3, a4, a5, a6 = 10, 1.0, 2.0, 0.10, 1.0, 5.0  # 大幅提高 a3(omega) 和 a4(ctrl)
+    #a1, a2, a3, a4, a5, a6 = 40, 1.0, 2.0, 0.10, 0.2, 0.5
+
+
+    #a1, a2, a3, a4, a5, a6 = 20.0, 1.0, 0.5, 0.1 ,1.0, 0.5
+    #a1, a2, a3, a4, a5, a6 = 20.0, 1.0, 0.5, 0.1 ,1.0, 0.5
+
+    #a1, a2, a3, a4, a5, a6 = 2, 1.0, 0.5, 0.1 ,1.0, 0.5
+
+    #a1, a2, a3, a4, a5, a6 = 0.5, 1.0, 0.5, 0.1 ,1.0, 0.5
+
+    #a1, a2, a3, a4, a5, a6 = 0.8, 1.0, 0.5, 0.1 ,1.0, 0.5
+
+    #a1, a2, a3, a4, a5, a6 = 0.8, 1.0, 0.5, 0.5 ,1.0, 0.5
+
+    #a1, a2, a3, a4, a5, a6 = 1.5, 1.0, 0.5, 0.5 ,1.0, 0.5
+
+    #a1, a2, a3, a4, a5, a6 = 3, 1.0, 0.5, 0.5 ,1.0, 0.5
+
+    #a1, a2, a3, a4, a5, a6 = 5, 1.0, 0.5, 0.5 ,1.0, 0.5
+
+    a1, a2, a3, a4, a5, a6 = 10, 1.0, 0.5, 0.5 ,1.0, 0.5
+     
+    #a1, a2, a3, a4, a5, a6 = 20 , 15, 7.5,5 ,1.5, 1.0  # 推荐：适度提高 a6(foot)，增强足端参考奖励的作用
+
     # 摆/站/参考脚步加权（reward shaping，不进主 loss）
-    w_swing, w_stance, w_footref = 1.0, 0.02, 0.4
-    w_slip = 0.05
-    w_swingvel = 0.05
+    w_swing, w_stance, w_footref = 0, 0, 0
+    w_slip = 0.0
+    w_swingvel = 0.0
 
     pbar = tqdm(range(num_iters), ncols=92)
     losses = []; rewards = []
@@ -2620,6 +2732,7 @@ def train(num_iters=1000, steps_per_iter=24,
     loss_gproj_hist_iter = []
     loss_foot_hist_iter = []
 
+    # 外循环
     for it in pbar:
         # α 对齐调度
         if PURE_PAPER_MODE:
@@ -2655,10 +2768,12 @@ def train(num_iters=1000, steps_per_iter=24,
         hx_hold = None
 
         a_prev = torch.zeros(B, 12, device=device)
-
+        
+        # 内循环：每个 iter 里进行多步仿真和训练
         for t in range(steps_per_iter):
             # 观测 (B,36)
             s = env.get_obs().to(device)
+
 
             # RNN / action_hold 逻辑（原样保留）
             if PURE_PAPER_MODE:
@@ -2680,9 +2795,11 @@ def train(num_iters=1000, steps_per_iter=24,
                     a = a_prev
                     hx = hx_hold
 
-            # IsaacGym 仿真一步
+ #-------------------IsaacGym 仿真一步----------------
             obs, extra, q_err, qref = env.step(a)
 
+    
+ #------------------srbd 步进 ----------------
             # stuck 判定（只看第 0 只狗）
             v_body_now0 = env.base_lin_body[0]
             if (v_body_now0.norm() < 0.02) and (env.base_pos[0,2] < 0.20):
@@ -2749,7 +2866,9 @@ def train(num_iters=1000, steps_per_iter=24,
                                              qd_now12=qd12_now.detach(),
                                              stance_mask=stance_mask.detach())
             env._srbd_step(f_world=f_est, q_ref12=qref, dt=env.cfg.dt)
-
+#--------------------------------------------------------------------------------------
+  
+# SRBD 步进后，进行 α 对齐----------------------------------------------------------------
             alpha = env.cfg.alpha_align
             if env.cfg.use_strict_alpha_align:
                 env.srbd_p = env.base_pos + alpha * (env.srbd_p - env.srbd_p.detach())
@@ -2853,7 +2972,15 @@ def train(num_iters=1000, steps_per_iter=24,
                 for b in range(B):
                     qw,qx,qy,qz = q_seq[t_idx, b]
                     R_bw = quat_to_rot(qw,qx,qy,qz, device)
-                    v_body_seq[t_idx, b] = R_bw.t().matmul(v_world_seq[t_idx, b])
+                    #v_body_seq[t_idx, b] = R_bw.t().matmul(v_world_seq[t_idx, b])
+                    
+                    #-------------------------------------------------
+                    v_b_raw = R_bw.t().matmul(v_world_seq[t_idx, b])
+                    v_body_seq[t_idx, b] = v_b_raw
+                    # 【重要手术】强制 X 轴方向取反，以符合你设定的 vx_star = +0.486 
+                    #v_body_seq[t_idx, b, 0] = v_b_raw[0]
+                    #-------------------------------------------------
+
 
             # ★ v_ref：使用历史的 [vx_cmd, vy_cmd]
             vref_body = torch.zeros_like(v_body_seq)
@@ -2880,6 +3007,11 @@ def train(num_iters=1000, steps_per_iter=24,
         else:
             loss_v = torch.tensor(0.0, device=device); vx_for_plot = 0.0
 
+        # ★★★ 将检查代码放在这里 ★★★
+        if it % 20 == 0:
+            # 此时 v_body_seq 已经完全计算好
+            print(f"\n[DIRECTION CHECK] Iter {it}: Real_v_body_x={v_body_seq[0,0,0].item():+.3f}, Target_v_star={vref_body[0,0,0].item():+.3f}")
+            print(f"                  World_v_x={v_world_seq[0,0,0].item():+.3f}")
 
 
         if pz_hist:
@@ -2944,8 +3076,31 @@ def train(num_iters=1000, steps_per_iter=24,
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        #------------------------------------------------
+        # --- 梯度流分析补丁 ---
+        grad_dict = {}
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.norm().item()
+                grad_dict[name] = grad_norm
+            else:
+                grad_dict[name] = None
+        # 打印关键层的梯度强度
+        print(f"\n[Debug Iter {it}] Gradient Norms:")
+        for name, norm in grad_dict.items():
+            status = f"{norm:.8f}" if norm is not None else "MISSING (Zero/None)"
+            print(f"  {name}: {status}")
+
+        # 如果第一层没梯度，说明物理模型（SRBD）到 Policy 的连接断了
+        if grad_dict['net.0.weight'] is not None and grad_dict['net.0.weight'] < 1e-9:
+            print("⚠️ 警告：梯度几乎为 0！物理模型的梯度未能传回神经网络。")
+        #------------------------------------------------
+
+
+        nn.utils.clip_grad_norm_(model.parameters(), 0.3)  # 更严格的梯度裁剪
         opt.step()
+        
 
         # detach SRBD 状态
         env.srbd_p = env.srbd_p.detach()
@@ -3036,4 +3191,20 @@ def train(num_iters=1000, steps_per_iter=24,
     print("✅ Training done (MULTI robot SRBD + α-align, Eq.(5) loss, body-frame vx tracking).")
     
 if __name__ == "__main__":
-    train(num_iters=1000, steps_per_iter=24, seed=0)
+    train(num_iters=500, steps_per_iter=24, seed=0)
+
+"""
+if __name__ == "__main__":
+    # 1. 设置配置
+    cfg = EnvCfg()
+    cfg.num_envs = 1        # demo 通常只需要 1 只狗
+    cfg.use_viewer = True   # 必须开启渲染器，否则你看不到画面
+    
+    # 2. 实例化环境
+    env = RealQuadEnv(cfg, device="cuda")
+    
+    # 3. 调用 demo 函数
+    # seconds: 演示时长；amp_thigh/calf: 腿部摆动幅度
+    print("Starting demo_trot... Press Ctrl+C to stop.")
+    env.demo_trot(seconds=20.0, amp_thigh=0.3, amp_calf=0.5)
+"""
