@@ -179,7 +179,9 @@ def create_ground_plane(gym, sim):
     plane_params.static_friction  = 1.0
     plane_params.dynamic_friction = 1.0
     plane_params.restitution      = 0.0
+    print("DEBUG 3: before add_ground", flush=True)
     gym.add_ground(sim, plane_params)
+    print("DEBUG 4: after add_ground", flush=True)
 
 def create_random_rough_terrain(gym, sim):
     """
@@ -290,7 +292,7 @@ class EnvCfg:
  
     # gait
     use_paper_raibert: bool = True # True=论文原始式子, False=工程增强版（机体 vx tracking）
-    step_freq: float = 2.2
+    step_freq: float = 1 # 
     
     # 随机步频开关 - True 开； False 关（固定 step_freq）
     rand_step_freq: bool = False       # True: sample step_freq_B on reset/reset_envs; False: use constant step_freq
@@ -305,9 +307,9 @@ class EnvCfg:
     k_raibert: float = 0
     x_bias: float = 0.0
     # 训练前期建议：抬脚高一点 + touchdown 反馈小一点（否则很容易把落脚点推到腿够不到的位置）.03          # 额外前移落脚偏置（m）
-    swing_height: float = 0.025
+    swing_height: float = 0.1 #0.025
     # ✅ (新增) 用于 _update_gait_from_cmd 的 swing height 上限；必须 >= swing_height
-    swing_height_max: float = 0.05
+    swing_height_max: float = 0.1
 
     raibert_fb_clip: float = 0.15       # m，touchdown 反馈项每轴限幅
 
@@ -526,7 +528,9 @@ class RealQuadEnv:
         sim_params.use_gpu_pipeline = self.cfg.use_gpu_pipeline
         _setup_physx_stable(sim_params, use_gpu=True)
 
-        self.sim = self.gym.create_sim(0, 0, gymapi.SIM_PHYSX, sim_params)
+        print("DEBUG 1: before create_sim", flush=True)
+        self.sim = self.gym.create_sim(0, -1, gymapi.SIM_PHYSX, sim_params)
+        print("DEBUG 2: after create_sim", flush=True)
         assert self.sim is not None, "create_sim 失败"
 
         # ===== 地形 / 地面：根据开关选择 =====
@@ -553,7 +557,7 @@ class RealQuadEnv:
 
 
         # 加载资产
-        ASSET_ROOT = "/home/rongenz/unitree_rl_gym-main/resources/robots/go2/urdf"
+        ASSET_ROOT = "/root/bayes-tmp/yulong/DiffSim/go2/urdf"
         ASSET_FILE = "go2.urdf"
 
         asset_opts = gymapi.AssetOptions()
@@ -572,6 +576,8 @@ class RealQuadEnv:
         if hasattr(asset_opts, "flip_visual_attachments"):
             asset_opts.flip_visual_attachments = True
 
+        print("DEBUG 5: before load_asset", flush=True)
+        print(ASSET_ROOT,ASSET_FILE)
         self.robot_asset = self.gym.load_asset(self.sim, ASSET_ROOT, ASSET_FILE, asset_opts)
         assert self.robot_asset is not None, f"加载 {ASSET_FILE} 失败，请检查路径。"
 
@@ -2667,7 +2673,7 @@ def train(num_iters=1000, steps_per_iter=24,
     cfg = EnvCfg()
     cfg.trot_style = "normal"   # or "normal" / "run"
     cfg.rand_cmd = False          # ✅ 开启随机速度指令
-    cfg.vx_min = +0.4        # 你可以改成论文的命令范围
+    cfg.vx_min = +0.5        # 你可以改成论文的命令范围
     cfg.vx_max = +0.5
     cfg.train_no_aerial = True
 
@@ -2712,7 +2718,12 @@ def train(num_iters=1000, steps_per_iter=24,
 
     #a1, a2, a3, a4, a5, a6 = 5, 1.0, 0.5, 0.5 ,1.0, 0.5
 
-    a1, a2, a3, a4, a5, a6 = 10, 1.0, 0.5, 0.5 ,1.0, 0.5
+    a1 = 10, # velocity
+    a2 = 1.0, # height
+    a3 = 0.01, # omega
+    a4 = 0.01, # ctrl
+    a5 = 0.5, # gravity projection
+    a6 = 5.0 # foot ref 
      
     #a1, a2, a3, a4, a5, a6 = 20 , 15, 7.5,5 ,1.5, 1.0  # 推荐：适度提高 a6(foot)，增强足端参考奖励的作用
 
