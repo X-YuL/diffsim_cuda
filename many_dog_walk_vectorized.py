@@ -292,7 +292,12 @@ class EnvCfg:
  
     # gait
     use_paper_raibert: bool = True # True=论文原始式子, False=工程增强版（机体 vx tracking）
-    step_freq: float = 1 # 
+    
+    #step_freq: float = 1 # 
+    #step_freq: float = 1.3
+    #step_freq: float = 1.4
+    #step_freq: float = 1.6
+    step_freq: float = 1.6 # 视 1.5 是最优解
     
     # 随机步频开关 - True 开； False 关（固定 step_freq）
     rand_step_freq: bool = False       # True: sample step_freq_B on reset/reset_envs; False: use constant step_freq
@@ -307,9 +312,12 @@ class EnvCfg:
     k_raibert: float = 0
     x_bias: float = 0.0
     # 训练前期建议：抬脚高一点 + touchdown 反馈小一点（否则很容易把落脚点推到腿够不到的位置）.03          # 额外前移落脚偏置（m）
-    swing_height: float = 0.1 #0.025
+    #swing_height: float = 0.1 #0.025
     # ✅ (新增) 用于 _update_gait_from_cmd 的 swing height 上限；必须 >= swing_height
-    swing_height_max: float = 0.1
+    #swing_height_max: float = 0.1
+
+    swing_height: float = 0.12
+    swing_height_max: float = 0.12
 
     raibert_fb_clip: float = 0.15       # m，touchdown 反馈项每轴限幅
 
@@ -529,7 +537,7 @@ class RealQuadEnv:
         _setup_physx_stable(sim_params, use_gpu=True)
 
         print("DEBUG 1: before create_sim", flush=True)
-        self.sim = self.gym.create_sim(0, -1, gymapi.SIM_PHYSX, sim_params)
+        self.sim = self.gym.create_sim(0, 0, gymapi.SIM_PHYSX, sim_params)
         print("DEBUG 2: after create_sim", flush=True)
         assert self.sim is not None, "create_sim 失败"
 
@@ -557,7 +565,7 @@ class RealQuadEnv:
 
 
         # 加载资产
-        ASSET_ROOT = "/root/bayes-tmp/yulong/DiffSim/go2/urdf"
+        ASSET_ROOT = "/home/rongenz/unitree_rl_gym-main/resources/robots/go2/urdf"
         ASSET_FILE = "go2.urdf"
 
         asset_opts = gymapi.AssetOptions()
@@ -1703,7 +1711,7 @@ class RealQuadEnv:
         p_stance[..., 0:2] = self.last_contact_xy
         p_stance[..., 2]   = self.last_contact_z
 
-
+        """
         # ---------- 6) SWING 分支：摆线轨迹 (教材 9.3 / 式 9.14-9.15) ----------
         dt = cfg.dt
         step_freq = getattr(self, "step_freq_B", torch.full((B,), cfg.step_freq, device=dev))
@@ -1766,7 +1774,46 @@ class RealQuadEnv:
         p_swing = torch.zeros_like(p_foot_now)
         p_swing[..., 0:2] = foot_xy_swing
         p_swing[..., 2]   = foot_z_swing
+        """
 
+        # ---------- 6) SWING 分支：旧二次抛物线 ----------
+        dt = cfg.dt
+        step_freq = getattr(self, "step_freq_B", torch.full((B,), cfg.step_freq, device=dev))
+        T = 1.0 / step_freq
+
+        _, p_land_xy_world = self._raibert_touchdown_world(phases)   # (B,4,2)
+
+        u = self._phase_u(phases)                                    # (B,4)
+        beta4 = beta_B.view(B, 1).expand(B, 4)
+        den = (1.0 - beta4).clamp_min(1e-6)
+        raw = ((u - beta4) / den).clamp(0.0, 1.0)
+        is_swing = (u >= beta4)
+        swing_phase = torch.where(is_swing, raw, torch.zeros_like(u))  # (B,4)
+        s = swing_phase.unsqueeze(-1)                                   # (B,4,1)
+
+        # 起点 p0（world）
+        p0 = self.last_liftoff_xyz.detach().clone()                     # (B,4,3)
+
+        # 终点 p1（world）
+        p1 = torch.zeros_like(p0)
+        p1[..., 0:2] = p_land_xy_world
+        p1[..., 2]   = self.last_contact_z
+
+        # 中点 pm（world）
+        h_env = getattr(
+            self,
+            "swing_height_B",
+            torch.full((B,), cfg.swing_height, device=dev)
+        )                                                               # (B,)
+        h_leg = h_env.view(B, 1).expand(-1, 4)                          # (B,4)
+
+        pm = 0.5 * (p0 + p1)
+        pm[..., 2] = 0.5 * (p0[..., 2] + p1[..., 2]) + h_leg
+
+        # 二次抛物线
+        p_swing = self._swing_parabola(p0, pm, p1, s)                  # (B,4,3)
+        
+        """
         # ====== (新增) 严格教材式摆线速度输出：式 (9.15) ======
         # xdot = (x1-x0)/T * (1 - cos 2πp)
         # ydot = (y1-y0)/T * (1 - cos 2πp)
@@ -1791,7 +1838,8 @@ class RealQuadEnv:
         v_foot_ref_world = torch.where(stop3.expand(-1, -1, 3),
                                        torch.zeros_like(v_foot_ref_world),
                                        v_foot_ref_world)
-
+        """
+        v_foot_ref_world = torch.zeros_like(p_foot_now)
         # ---------- 7) 混合 ----------
         p_foot_target = stance_mask * p_stance + (1.0 - stance_mask) * p_swing
 
@@ -2718,12 +2766,16 @@ def train(num_iters=1000, steps_per_iter=24,
 
     #a1, a2, a3, a4, a5, a6 = 5, 1.0, 0.5, 0.5 ,1.0, 0.5
 
+    """
     a1 = 10, # velocity
     a2 = 1.0, # height
     a3 = 0.01, # omega
     a4 = 0.01, # ctrl
     a5 = 0.5, # gravity projection
     a6 = 5.0 # foot ref 
+    """
+    
+    a1, a2, a3, a4, a5, a6 = 10, 1.0, 0.01, 0.01 ,0.5, 5.0
      
     #a1, a2, a3, a4, a5, a6 = 20 , 15, 7.5,5 ,1.5, 1.0  # 推荐：适度提高 a6(foot)，增强足端参考奖励的作用
 
@@ -3202,7 +3254,7 @@ def train(num_iters=1000, steps_per_iter=24,
     print("✅ Training done (MULTI robot SRBD + α-align, Eq.(5) loss, body-frame vx tracking).")
     
 if __name__ == "__main__":
-    train(num_iters=500, steps_per_iter=24, seed=0)
+    train(num_iters=1000, steps_per_iter=24, seed=0)
 
 """
 if __name__ == "__main__":
