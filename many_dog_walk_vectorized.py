@@ -285,7 +285,7 @@ class EnvCfg:
     use_viewer: bool = False  #训练时是否渲染？True - 渲染但会满慢很多 ； False - 不渲染
     action_hold: int = 5      # 100 Hz 控制
 
-    pd_kp: float = 60       #60
+    pd_kp: float = 60      #60
     pd_kd: float = 2        #2
     q_default: tuple = (0.0, 0.9, -1.20)
     #q_default: tuple = (0.0, 0.8, -1.50)
@@ -432,37 +432,6 @@ class RealQuadEnv:
         ]
 
         # 默认站立姿态
-
-        """
-        #目前 trot 适应 1 m/s 的姿态
-        self.q_default_np = np.array([
-            +0.1, +0.8, -1.50,
-            -0.1, +0.8, -1.50,
-            +0.1, +0.8, -1.50,
-            -0.1, +0.8, -1.50
-        ], dtype=np.float32)
-        """
-       
-        """
-        #目前最好 - 全姿态通用！！！ 
-        #在这个姿态下，trot/bound/gallop 都能跑 1m/s ; pace 能跑 0.7m/s
-        #固定频率 4Hz 下测试；目标速度 1m/s
-        self.q_default_np = np.array([
-            +0.0, +1.0, -1.50,
-            -0.0, +1.0, -1.50,
-            +0.0, +1.0, -1.50,
-            -0.0, +1.0, -1.50
-        ], dtype=np.float32)
-        """
-        """
-        self.q_default_np = np.array([
-            +0.0, +0.77, -1.20,
-            -0.0, +0.77, -1.20,
-            +0.0, +0.77, -1.20,
-            -0.0, +0.77, -1.20
-        ], dtype=np.float32)
-        """
-
         
         self.q_default_np = np.array([
              0.0, 0.86, -1.40,
