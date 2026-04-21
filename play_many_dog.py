@@ -1,36 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-play.py - 使用 many_dog_walk.py 训练好的策略，在 Isaac Gym 中实时播放多狗行走。
+play.py - Use trained policy to play multi-dog walking in Isaac Gym in real-time.
 
-用法示例：
-    python play.py                           # 默认用 4 只狗 + 随机速度指令
-    python play.py --num_envs 16            # 16 只狗一起跑
-    python play.py --no_rand_cmd            # 固定 0.2 m/s 行走
-    python play.py --gait_mode 1            # 固定 trot 步态
-    python play.py --weights your_ckpt.pth  # 指定权重文件
+Usage examples:
+    python play_many_dog.py                           # Default: 4 dogs + random velocity commands
+    python play_many_dog.py --num_envs 16            # 16 dogs running together
+    python play_many_dog.py --no_rand_cmd            # Fixed 0.5 m/s walking
+    python play_many_dog.py --gait_mode 1            # Fixed trot gait
+    python play_many_dog.py --weights your_ckpt.pth  # Specify weight file
 """
 
 import os
 import argparse
 
-
-from many_dog_walk_vectorized import EnvCfg, RealQuadEnv, Policy, PURE_PAPER_MODE
+# ⚠️ CRITICAL: Isaac Gym must be imported BEFORE torch
+try:
+    from isaacgym import gymapi
+except Exception:
+    pass
 
 import torch
+
+from config import EnvCfg, PURE_PAPER_MODE
+from env import RealQuadEnv
+from policy import Policy
 
 
 def load_policy(weight_path: str,
                 device: torch.device,
                 dim_obs: int = 36,
                 dim_action: int = 12) -> Policy:
-    """构建 Policy，并从权重文件加载参数（如果存在）"""
+    """Build Policy and load parameters from weight file (if exists)"""
     policy = Policy(dim_obs, dim_action).to(device)
     if os.path.isfile(weight_path):
         state = torch.load(weight_path, map_location=device)
         policy.load_state_dict(state)
-        print(f"✅ 已从 {weight_path} 加载策略权重。")
+        print(f"✅ Loaded policy weights from {weight_path}.")
     else:
-        print(f"⚠️ 未找到权重文件 {weight_path}，将使用随机初始化策略。")
+        print(f"⚠️ Weight file {weight_path} not found, using randomly initialized policy.")
     policy.eval()
     return policy
 
@@ -41,67 +48,67 @@ def main():
         "--weights",
         type=str,
         default="quad_diffsim_srbd_align_multi_robot.pth",
-        help="策略权重文件路径（默认使用训练脚本保存的 pth）"
+        help="Policy weight file path (default: pth saved by training script)"
     )
     parser.add_argument(
         "--num_envs",
         type=int,
         default=None,
-        help="并行机器狗数量（不填则使用 EnvCfg 默认值）"
+        help="Number of parallel quadrupeds (if not specified, use EnvCfg default)"
     )
     parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="运行设备：cuda / cpu"
+        help="Device to run on: cuda / cpu"
     )
     parser.add_argument(
         "--no_rand_cmd",
         action="store_true",
-        help="关闭随机速度指令，使用固定 0.2 m/s"
+        help="Disable random velocity commands, use fixed 0.2 m/s"
     )
     parser.add_argument(
         "--gait_mode",
         type=int,
         default=None,
-        help="步态模式：-1=每个 env 随机, 0=stand, 1=trot, 2=pace, 3=bound"
+        help="Gait mode: -1=random per env, 0=stand, 1=trot, 2=pace, 3=bound"
     )
     parser.add_argument(
         "--max_steps",
         type=int,
         default=0,
-        help="最多运行多少步；0 表示无限运行，直到关闭 viewer"
+        help="Maximum steps to run; 0 means run indefinitely until viewer is closed"
     )
     args = parser.parse_args()
 
     device = torch.device(args.device)
 
-    # -------- 构建 EnvCfg --------
+    # -------- Build EnvCfg --------
     cfg = EnvCfg()
-    # 并行狗数
+    # Number of parallel dogs
     if args.num_envs is not None:
         cfg.num_envs = args.num_envs
 
-    # 播放模式：必须打开 viewer
+    # Play mode: must enable viewer
     cfg.use_viewer = True
     cfg.use_gpu_pipeline = True
 
-    # 速度指令开关
+    # Velocity command switch
     if args.no_rand_cmd:
-        cfg.rand_cmd = False  # 固定 vx_star = 0.2
-    # 步态模式（可选）
+        cfg.rand_cmd = False  # Fixed vx_star = 0.2
+    # Gait mode (optional)
     if args.gait_mode is not None:
         cfg.gait_mode = args.gait_mode
 
-    # -------- 构建环境 & 策略 --------
+    # -------- Build environment & policy --------
     env = RealQuadEnv(cfg, device=device)
-    env.reset()  # 初始化到“站立 + 随机/固定指令”
+    env.reset()  # Initialize to “standing + random/fixed commands”
 
     policy = load_policy(args.weights, device)
     B = env.B
     dim_action = 12
 
-    # 按照 many_dog_walk.train 的逻辑做 action_hold / 平滑
+    # Follow many_dog_walk.train logic for action_hold / smoothing
     hx = None
     a_prev = torch.zeros(B, dim_action, device=device)
     hx_hold = None
@@ -109,18 +116,18 @@ def main():
     t = 0
     steps_done = 0
 
-    print("🎮 开始播放 DiffSim Quadruped 多狗环境")
-    print(f"   并行机器狗数量 B = {B}")
-    print("   提示：在 Isaac Gym viewer 窗口中自由移动摄像机，关闭窗口即可退出。")
+    print("🎮 Starting DiffSim Quadruped multi-dog environment playback")
+    print(f"   Number of parallel quadrupeds B = {B}")
+    print("   Tip: Move camera freely in Isaac Gym viewer window, close window to exit.")
 
     try:
         while True:
-            # 观测：与训练完全一致 (B, 36)
+            # Observation: exactly same as training (B, 36)
             with torch.no_grad():
                 s = env.get_obs().to(device)
 
                 if PURE_PAPER_MODE:
-                    # 论文版：只做 action_hold，不做动作平滑
+                    # Paper version: only action_hold, no action smoothing
                     if (t % cfg.action_hold) == 0:
                         a, hx = policy(s, hx)  # (B, 12)
                         a_prev = a
@@ -129,7 +136,7 @@ def main():
                         a = a_prev
                         hx = hx_hold
                 else:
-                    # 工程版：action_hold + 简单 EMA 平滑
+                    # Engineering version: action_hold + simple EMA smoothing
                     if (t % cfg.action_hold) == 0:
                         a_raw, hx = policy(s, hx)  # (B, 12)
                         a_smooth = 0.7 * a_prev + 0.3 * a_raw
@@ -140,32 +147,32 @@ def main():
                         a = a_prev
                         hx = hx_hold
 
-            # 环境前进一步（里面会自动调用 IsaacGym simulate + viewer 刷新）
+            # Environment step forward (automatically calls IsaacGym simulate + viewer refresh)
             obs, extra, q_err, q_ref = env.step(a)
 
             done = extra["done"]  # (B,)
             if done.any():
                 fallen_ids = torch.nonzero(done, as_tuple=False).squeeze(-1)
-                print(f"[play] 局部 reset envs: {fallen_ids.cpu().tolist()}")
+                print(f"[play] Partial reset envs: {fallen_ids.cpu().tolist()}")
                 env.reset_envs(fallen_ids)
-                # 如果以后换成 RNN 策略，可以在这里对对应 env 的 hidden state 清零
-                # 目前 Policy 不用隐藏状态，可以忽略 hx
+                # If switching to RNN policy later, can zero out hidden state for corresponding envs here
+                # Currently Policy doesn't use hidden state, can ignore hx
 
             t += 1
             steps_done += 1
 
-            # viewer 被关掉就退出
+            # Exit if viewer is closed
             if env.viewer is None:
-                print("Viewer 已关闭，退出 play。")
+                print("Viewer closed, exiting play.")
                 break
 
-            # 限制最大步数（可选）
+            # Limit maximum steps (optional)
             if args.max_steps > 0 and steps_done >= args.max_steps:
-                print(f"达到最大步数 {args.max_steps}，退出 play。")
+                print(f"Reached maximum steps {args.max_steps}, exiting play.")
                 break
 
     except KeyboardInterrupt:
-        print("收到 Ctrl+C，退出 play。")
+        print("Received Ctrl+C, exiting play.")
 
 
 if __name__ == "__main__":
