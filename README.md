@@ -33,7 +33,7 @@ It should be compatible with similar PyTorch/CUDA versions.
 To start the training process, run:
 
 ```bash```
-python many_dog_walk_vectorized.py
+python train.py
 
 ---
 
