@@ -161,8 +161,8 @@ class RealQuadEnv:
 
 
         # Load asset
-        ASSET_ROOT = "/home/rongenz/unitree_rl_gym-main/resources/robots/go2/urdf"
-        ASSET_FILE = "go2.urdf"
+        ASSET_ROOT = "/home/jakub/projects/BachelorThesis"
+        ASSET_FILE = "go2_description.urdf"
 
         asset_opts = gymapi.AssetOptions()
         asset_opts.fix_base_link = False
