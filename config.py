@@ -28,7 +28,7 @@ USE_COMPLEX_TERRAIN = False
 # ===============================
 # ⭐ SRBD CUDA Kernel Switch
 # ===============================
-CUDA_KERNEL_SRBD = False
+CUDA_KERNEL_SRBD = True
 # True  = Use custom CUDA kernel for _srbd_step (requires: python setup.py build_ext --inplace)
 # False = Use PyTorch implementation (default, always works)
 
