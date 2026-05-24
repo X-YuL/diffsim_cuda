@@ -25,6 +25,13 @@ USE_COMPLEX_TERRAIN = False
 # True  = Use random heightfield terrain (approximately infinite plane)
 # False = Use original flat ground plane
 
+# ===============================
+# ⭐ SRBD CUDA Kernel Switch
+# ===============================
+CUDA_KERNEL_SRBD = False
+# True  = Use custom CUDA kernel for _srbd_step (requires: python setup.py build_ext --inplace)
+# False = Use PyTorch implementation (default, always works)
+
 
 @dataclass
 class EnvCfg:

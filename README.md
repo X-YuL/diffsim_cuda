@@ -14,7 +14,11 @@ single_dog_training/
 ├── srbd.py                # Simplified rigid body dynamics model (SRBDModel)
 ├── env.py                 # Isaac Gym simulation environment (RealQuadEnv)
 ├── train.py               # Training main loop
-└── play_many_dog.py       # Policy playback script
+├── play_many_dog.py       # Policy playback script
+├── setup.py               # Build script for the SRBD CUDA extension
+└── src/
+    ├── srbd_ext.cpp       # pybind11 bindings for the CUDA kernel
+    └── srbd_cuda.cu       # Fused CUDA kernel: foot FK + SRBD dynamics step
 ```
 
 ## Features
@@ -30,8 +34,9 @@ single_dog_training/
 - **SRBD Model**: Simplified single rigid body dynamics for differentiable physics simulation
 - **α-Alignment Mechanism**: Blends real physics and SRBD predictions (default α=0.9)
 - **Raibert Foothold Planning**: Adaptive foothold calculation based on velocity feedback
-- **Multi-Environment Parallel Training**: Supports training multiple robots simultaneously (default 16)
+- **Multi-Environment Parallel Training**: Supports training multiple robots simultaneously (default 16, scales to ~1000+)
 - **GPU Acceleration**: Uses Isaac Gym's GPU physics pipeline
+- **Custom CUDA Kernel for SRBD** (optional): Fused kernel that replaces the per-step PyTorch ops with a single launch; toggled via `CUDA_KERNEL_SRBD` in `config.py`. Backward compatibility with autograd is preserved (see [SRBD CUDA Kernel](#srbd-cuda-kernel-optional))
 
 ### Loss Functions
 Training uses a weighted combination of multiple losses:
@@ -47,11 +52,15 @@ Training uses a weighted combination of multiple losses:
 
 ### Dependencies
 - Python 3.8+
-- PyTorch 1.10+
+- PyTorch 1.10+ (built with CUDA support)
 - Isaac Gym Preview 4
 - NumPy
 - Matplotlib
 - tqdm
+
+### Optional (only for the custom SRBD CUDA kernel)
+- CUDA Toolkit matching your PyTorch build (`nvcc --version` must work)
+- A C++ toolchain (gcc/clang on Linux, MSVC on Windows) — the same one PyTorch was built against
 
 ### Installing Isaac Gym
 ```bash
@@ -127,6 +136,7 @@ Main configuration in `EnvCfg` class in `config.py`:
 - `PURE_PAPER_MODE = True`: Pure paper version (no engineering tricks)
 - `USE_COMPLEX_TERRAIN = False`: Use random rough terrain
 - `ONLY_ITERATE_NO_RESET = True`: Only reset on first iteration
+- `CUDA_KERNEL_SRBD = False`: Use the custom fused CUDA kernel for `_srbd_step`. `False` = pure PyTorch (default, always works). `True` = CUDA kernel (requires `python setup.py build_ext --inplace` first; see [SRBD CUDA Kernel](#srbd-cuda-kernel-optional)).
 
 ## Training Output
 
@@ -182,6 +192,79 @@ env.srbd_p = env.base_pos + alpha * (env.srbd_p - env.srbd_p.detach())
 env.srbd_v = env.base_lin + alpha * (env.srbd_v - env.srbd_v.detach())
 ```
 
+## SRBD CUDA Kernel (optional)
+
+The per-step centroidal dynamics in `SRBDModel._srbd_step` can run through either of two backends, selected by a single switch in `config.py`:
+
+```python
+# config.py
+CUDA_KERNEL_SRBD = False   # PyTorch (default — always works, no build step)
+CUDA_KERNEL_SRBD = True    # Custom fused CUDA kernel (requires building the extension)
+```
+
+When `True`, `srbd.py` imports the compiled `srbd_cuda_ext` module and dispatches the forward pass through a single fused kernel in `src/srbd_cuda.cu` (foot FK + force/torque accumulation + Newton-Euler dynamics + quaternion integration, all in one launch). Backward is implemented via a `torch.autograd.Function` wrapper (`SRBDStepFunction`) that re-runs the PyTorch reference and uses `torch.autograd.grad` to compute exact gradients — so loss.backward() works identically under both backends, and gradients propagate through the SRBD state across the full rollout (matching the pure-PyTorch behavior).
+
+If the extension is not built, the code prints a warning and silently falls back to the PyTorch path, so toggling the flag is always safe.
+
+### Building the extension
+
+The extension uses `torch.utils.cpp_extension.CUDAExtension`. By default `setup.py` cross-compiles for every major NVIDIA architecture from Pascal (sm_60) through Hopper (sm_90), plus PTX for forward-compatibility with future GPUs (≈ 3–8 minutes the first time):
+
+```bash
+# From the project root, with your conda environment active
+python setup.py build_ext --inplace
+```
+
+This produces `srbd_cuda_ext*.so` (Linux) / `srbd_cuda_ext*.pyd` (Windows) in the project root.
+
+For faster iteration during development, restrict the build to the GPU on the current machine (~30 s):
+
+```bash
+# Linux
+TORCH_CUDA_ARCH_LIST="native" python setup.py build_ext --inplace
+```
+
+```powershell
+# Windows PowerShell
+$env:TORCH_CUDA_ARCH_LIST = "native"
+python setup.py build_ext --inplace
+```
+
+### Running training with the CUDA kernel
+
+```bash
+# 1) Set the flag in config.py:
+#    CUDA_KERNEL_SRBD = True
+# 2) Run training as usual:
+python train.py
+```
+
+On the first import you should see:
+
+```
+[SRBD] Custom CUDA kernel active (CUDA_KERNEL_SRBD=True in config.py).
+```
+
+If the extension is missing or fails to import, you will instead see:
+
+```
+[SRBD] WARNING: CUDA_KERNEL_SRBD=True but extension not found (...).
+[SRBD]          Falling back to PyTorch implementation.
+[SRBD]          Run: python setup.py build_ext --inplace
+```
+
+### When to enable it
+
+- **Small `num_envs` (≤ 64)**: PyTorch is usually fine; the kernel-launch overhead of the many small ops doesn't dominate.
+- **Large `num_envs` (a few hundred to a few thousand)**: the fused kernel becomes substantially faster than the PyTorch path because it replaces dozens of small dispatched ops per env with a single launch, and the per-env working set fits entirely in L2.
+- **For debugging / numerical comparison**: keep `CUDA_KERNEL_SRBD = False`. The PyTorch path is the reference implementation.
+
+### Requirements (CUDA kernel only)
+
+- A working PyTorch CUDA install (`python -c "import torch; print(torch.cuda.is_available())"` returns `True`).
+- A CUDA Toolkit on `PATH` matching your PyTorch build (`nvcc --version`).
+- A C++ compiler compatible with that PyTorch build (gcc/clang on Linux, MSVC Build Tools on Windows).
+
 ## Debugging Features
 
 ### Initial Fall Debugging Prints
@@ -233,6 +316,16 @@ A: After training, use the TorchScript model:
 model = torch.jit.load("quad_diffsim_srbd_align_multi_robot.pt")
 action = model(observation)  # (1, 36) -> (1, 12)
 ```
+
+### Q: `CUDA_KERNEL_SRBD = True` but I see the fallback warning?
+A: The extension hasn't been built (or not in the current Python environment). From the project root:
+```bash
+python setup.py build_ext --inplace
+```
+This produces `srbd_cuda_ext*.so` / `*.pyd` next to `srbd.py`. After that, set `CUDA_KERNEL_SRBD = True` in `config.py` and re-run. If the build itself fails, check that `nvcc --version` works and that the CUDA Toolkit matches your PyTorch build (`python -c "import torch; print(torch.version.cuda)"`).
+
+### Q: Do I need to rebuild the extension after every code change?
+A: Only after modifying `src/srbd_cuda.cu`, `src/srbd_ext.cpp`, or `setup.py`. Changes to `srbd.py` or any other `.py` file do **not** require a rebuild — just re-run `python train.py`.
 
 ## Citation
 
