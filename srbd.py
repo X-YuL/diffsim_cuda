@@ -122,40 +122,52 @@ class SRBDStepFunction(torch.autograd.Function):
         m, g, Ixx, Iyy, Izz, dt = ctx.physics
         dev = ctx.dev
 
-        # ctx.needs_input_grad is auto-populated by PyTorch: a tuple of bools,
-        # one per forward() input.  Slots 0..5 are the six tensor inputs
-        # (p, v, q, w, f_world, q_ref12); slots 6..11 are scalars (no grad).
-        nip = ctx.needs_input_grad
+        # ctx.needs_input_grad: tuple of bools, one per forward() input.
+        # Slots 0..5 are the six tensor inputs (p, v, q, w, f_world, q_ref12);
+        # slots 6..11 are scalars (always None grad).
+        needs = ctx.needs_input_grad[:6]
 
-        # Detach each saved tensor and selectively enable grad tracking.
-        # .detach() creates a fresh leaf; .requires_grad_(flag) sets the flag.
-        p_t  = p.detach().requires_grad_(nip[0])
-        v_t  = v.detach().requires_grad_(nip[1])
-        q_t  = q.detach().requires_grad_(nip[2])
-        w_t  = w.detach().requires_grad_(nip[3])
-        f_t  = f_world.detach().requires_grad_(nip[4])
-        qr_t = q_ref12.detach().requires_grad_(nip[5])
+        # Short-circuit when no input needs grad.  In practice PyTorch will
+        # not call backward in that case, but the guard keeps torch.autograd.grad
+        # from receiving an empty `inputs` list.
+        if not any(needs):
+            return (None,) * 12
 
-        # Re-run the PyTorch forward with gradient tracking enabled.
+        # Build a fresh leaf tensor per input with requires_grad=True so the
+        # re-run constructs a fully differentiable graph.  We later mask the
+        # returned grads with None for slots the upstream graph doesn't need.
+        p_t  = p.detach().requires_grad_(True)
+        v_t  = v.detach().requires_grad_(True)
+        q_t  = q.detach().requires_grad_(True)
+        w_t  = w.detach().requires_grad_(True)
+        f_t  = f_world.detach().requires_grad_(True)
+        qr_t = q_ref12.detach().requires_grad_(True)
+
         with torch.enable_grad():
             outputs = _srbd_step_pytorch_fn(
                 p_t, v_t, q_t, w_t, f_t, qr_t,
                 m, g, Ixx, Iyy, Izz, dt, dev
             )
 
-        # Compute grads w.r.t. ALL six differentiable inputs in one VJP.
-        # allow_unused=True -> None for inputs disconnected from outputs
-        # or that had requires_grad=False (PyTorch accepts None grad slots).
-        grads = torch.autograd.grad(
+        # Only request grads for inputs the upstream graph actually needs.
+        # Passing a tensor with requires_grad=False (or omitted) here is what
+        # tripped the original "Tensor does not require grad" error.
+        inputs_all = [p_t, v_t, q_t, w_t, f_t, qr_t]
+        wanted = [t for t, n in zip(inputs_all, needs) if n]
+
+        grads_wanted = torch.autograd.grad(
             outputs=list(outputs),
-            inputs=[p_t, v_t, q_t, w_t, f_t, qr_t],
+            inputs=wanted,
             grad_outputs=[grad_p_new, grad_v_new, grad_q_new, grad_w_new],
             only_inputs=True,
             allow_unused=True,
         )
 
+        it = iter(grads_wanted)
+        g_p, g_v, g_q, g_w, g_f, g_qr = [next(it) if n else None for n in needs]
+
         # Gradient slots: p, v, q, w, f_world, q_ref12, m, g, Ixx, Iyy, Izz, dt
-        return (grads[0], grads[1], grads[2], grads[3], grads[4], grads[5],
+        return (g_p, g_v, g_q, g_w, g_f, g_qr,
                 None, None, None, None, None, None)
 
 
