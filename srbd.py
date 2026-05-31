@@ -32,86 +32,35 @@ if _USE_CUDA_KERNEL:
 
 
 # ---------------------------------------------------------------------------
-# Standalone PyTorch forward function for _srbd_step
-#
-# This is the same math as SRBDModel._srbd_step but expressed as a pure
-# function (no class state).  It is used by:
-#   1. SRBDStepFunction.backward  — re-run with grad tracking to get grads
-#   2. (optionally) as a reference for numerical verification
-# ---------------------------------------------------------------------------
-def _srbd_step_pytorch_fn(p, v, q, w, f_world, q_ref12, m, g, Ixx, Iyy, Izz, dt, device):
-    """Pure PyTorch SRBD step: inputs → (p_new, v_new, q_new, w_new)."""
-    Fsum = f_world.sum(dim=1) + torch.tensor([0.0, 0.0, -m*g], device=device).view(1, 3)
-    a = Fsum / m
-
-    B = p.shape[0]
-    L1, L2 = 0.213, 0.213
-    hip_offsets = torch.tensor([
-        [+0.1934, +0.1420, 0.0],
-        [+0.1934, -0.1420, 0.0],
-        [-0.1934, +0.1420, 0.0],
-        [-0.1934, -0.1420, 0.0],
-    ], device=device)
-
-    R = quat_to_rot(q[:, 0], q[:, 1], q[:, 2], q[:, 3], device)  # (B,3,3)
-    hip_world = p.unsqueeze(1) + torch.einsum('bij,nj->bni', R, hip_offsets)
-    q_leg = q_ref12.view(B, 4, 3)
-    q2, q3 = q_leg[:, :, 1], q_leg[:, :, 2]
-    ox = L1*torch.sin(q2) + L2*torch.sin(q2 + q3)
-    oz = -L1*torch.cos(q2) - L2*torch.cos(q2 + q3)
-    off_world = torch.einsum('bij,bnj->bni', R,
-                             torch.stack([ox, torch.zeros_like(ox), oz], dim=-1))
-    p_foot = hip_world + off_world  # (B,4,3)
-
-    r = p_foot - p.unsqueeze(1)
-    tau_world = torch.cross(r, f_world, dim=-1).sum(dim=1)
-    tau_body = torch.einsum('bji,bj->bi', R, tau_world)
-
-    I_diag = torch.tensor([Ixx, Iyy, Izz], device=device)
-    Iw = w * I_diag.unsqueeze(0)
-    wdot = (tau_body - torch.cross(w, Iw, dim=-1)) / I_diag.unsqueeze(0)
-    w_new = w + wdot * dt
-
-    wx, wy, wz = w_new.unbind(dim=-1)
-    z = torch.zeros_like(wx)
-    Omega = torch.stack([
-        torch.stack([z,  -wx, -wy, -wz], dim=-1),
-        torch.stack([wx,  z,   wz, -wy], dim=-1),
-        torch.stack([wy, -wz,  z,   wx], dim=-1),
-        torch.stack([wz,  wy, -wx,  z ], dim=-1),
-    ], dim=1)
-    qdot = 0.5 * torch.einsum('bij,bj->bi', Omega, q)
-    q_new = q + qdot * dt
-    q_new = q_new / (q_new.norm(dim=-1, keepdim=True) + 1e-9)
-
-    return p + v*dt, v + a*dt, q_new, w_new
-
-
-# ---------------------------------------------------------------------------
 # SRBDStepFunction — torch.autograd.Function wrapper
 #
-# Forward: calls the fast CUDA kernel (srbd_step_kernel).
-# Backward: re-runs the same computation in PyTorch with gradient tracking
-#           and uses torch.autograd.grad to recover gradients.  This avoids
-#           writing manual derivative formulas while preserving correctness.
+# Forward : calls srbd_step_forward (one-thread-per-env CUDA kernel).
+# Backward: calls srbd_step_backward (hand-written analytic adjoint).
 #
-# All six tensor inputs (p, v, q, w, f_world, q_ref12) carry gradients.
-# This is required because within a training iteration the SRBD state
-# (srbd_p/v/q/w) carries grad_fn chains back into previous steps' policy
-# outputs (the strict alpha-alignment at train.py:188-192 deliberately
-# preserves these chains with multiplier alpha).  Detachment only happens
-# at the iteration boundary (train.py:415-418), not at every step.
+# All six tensor inputs (p, v, q, w, f_world, q_ref12) can carry gradients.
+# Within a training iteration the SRBD state (srbd_p/v/q/w) carries grad_fn
+# chains back into previous steps' policy outputs (the strict alpha-alignment
+# at train.py:188-192 preserves these chains with multiplier alpha).
+# Detachment happens at the iteration boundary (train.py:415-418), not per step.
 # ---------------------------------------------------------------------------
 class SRBDStepFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, p, v, q, w, f_world, q_ref12, m, g, Ixx, Iyy, Izz, dt):
+        # Saved tensors must be contiguous because the backward kernel
+        # re-reads them via raw float pointers.
+        p = p.contiguous()
+        v = v.contiguous()
+        q = q.contiguous()
+        w = w.contiguous()
+        f_world = f_world.contiguous()
+        q_ref12 = q_ref12.contiguous()
         ctx.save_for_backward(p, v, q, w, f_world, q_ref12)
         ctx.physics = (m, g, Ixx, Iyy, Izz, dt)
-        ctx.dev = f_world.device
 
+        # _ext returns a std::vector → Python list; autograd.Function expects
+        # a tuple of tensors, so unpack and repack explicitly.
         p_new, v_new, q_new, w_new = _srbd_cuda_ext.srbd_step_forward(
-            p.contiguous(), v.contiguous(), q.contiguous(), w.contiguous(),
-            f_world.contiguous(), q_ref12.contiguous(),
+            p, v, q, w, f_world, q_ref12,
             m, g, Ixx, Iyy, Izz, dt
         )
         return p_new, v_new, q_new, w_new
@@ -120,55 +69,31 @@ class SRBDStepFunction(torch.autograd.Function):
     def backward(ctx, grad_p_new, grad_v_new, grad_q_new, grad_w_new):
         p, v, q, w, f_world, q_ref12 = ctx.saved_tensors
         m, g, Ixx, Iyy, Izz, dt = ctx.physics
-        dev = ctx.dev
 
-        # ctx.needs_input_grad: tuple of bools, one per forward() input.
-        # Slots 0..5 are the six tensor inputs (p, v, q, w, f_world, q_ref12);
-        # slots 6..11 are scalars (always None grad).
+        # ctx.needs_input_grad: slots 0..5 are the tensor inputs;
+        # slots 6..11 are the scalars (always None grad).
         needs = ctx.needs_input_grad[:6]
-
-        # Short-circuit when no input needs grad.  In practice PyTorch will
-        # not call backward in that case, but the guard keeps torch.autograd.grad
-        # from receiving an empty `inputs` list.
         if not any(needs):
             return (None,) * 12
 
-        # Build a fresh leaf tensor per input with requires_grad=True so the
-        # re-run constructs a fully differentiable graph.  We later mask the
-        # returned grads with None for slots the upstream graph doesn't need.
-        p_t  = p.detach().requires_grad_(True)
-        v_t  = v.detach().requires_grad_(True)
-        q_t  = q.detach().requires_grad_(True)
-        w_t  = w.detach().requires_grad_(True)
-        f_t  = f_world.detach().requires_grad_(True)
-        qr_t = q_ref12.detach().requires_grad_(True)
-
-        with torch.enable_grad():
-            outputs = _srbd_step_pytorch_fn(
-                p_t, v_t, q_t, w_t, f_t, qr_t,
-                m, g, Ixx, Iyy, Izz, dt, dev
-            )
-
-        # Only request grads for inputs the upstream graph actually needs.
-        # Passing a tensor with requires_grad=False (or omitted) here is what
-        # tripped the original "Tensor does not require grad" error.
-        inputs_all = [p_t, v_t, q_t, w_t, f_t, qr_t]
-        wanted = [t for t, n in zip(inputs_all, needs) if n]
-
-        grads_wanted = torch.autograd.grad(
-            outputs=list(outputs),
-            inputs=wanted,
-            grad_outputs=[grad_p_new, grad_v_new, grad_q_new, grad_w_new],
-            only_inputs=True,
-            allow_unused=True,
+        g_p, g_v, g_q, g_w, g_f, g_qr = _srbd_cuda_ext.srbd_step_backward(
+            p, v, q, w, f_world, q_ref12,
+            grad_p_new.contiguous(),
+            grad_v_new.contiguous(),
+            grad_q_new.contiguous(),
+            grad_w_new.contiguous(),
+            m, g, Ixx, Iyy, Izz, dt,
         )
 
-        it = iter(grads_wanted)
-        g_p, g_v, g_q, g_w, g_f, g_qr = [next(it) if n else None for n in needs]
-
-        # Gradient slots: p, v, q, w, f_world, q_ref12, m, g, Ixx, Iyy, Izz, dt
-        return (g_p, g_v, g_q, g_w, g_f, g_qr,
-                None, None, None, None, None, None)
+        return (
+            g_p  if needs[0] else None,
+            g_v  if needs[1] else None,
+            g_q  if needs[2] else None,
+            g_w  if needs[3] else None,
+            g_f  if needs[4] else None,
+            g_qr if needs[5] else None,
+            None, None, None, None, None, None,
+        )
 
 
 # ---------------------------------------------------------------------------

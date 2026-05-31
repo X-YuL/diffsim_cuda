@@ -210,31 +210,19 @@ def train(num_iters=1000, steps_per_iter=24,
             foot_err_vec = (p_foot_srbd - pref) * swing_mask
             foot_ref_hist.append(foot_err_vec.clone())
 
-            # Angular velocity (body frame)
-            w_body_list = []
-            for b in range(B):
-                w_b = quat_rotate_inverse_wxyz(env.srbd_q[b], env.srbd_w[b], env.device)
-                w_body_list.append(w_b)
-            #w_body_srbd = torch.stack(w_body_list, dim=0)  # (B,3)
-            #omega_hist.append(w_body_srbd.clone())
-            w_body_srbd = env.srbd_w.clone()  # Already in body frame
-            omega_hist.append(w_body_srbd)
+            # Angular velocity (body frame) — env.srbd_w is already in body frame
+            omega_hist.append(env.srbd_w.clone())
 
-            # Gravity projection (body frame)
-            gproj_list = []
-            for b in range(B):
-                gproj_list.append(project_gravity_to_body(env.srbd_q[b], env.cfg.g, env.device))
-            gproj_hist.append(torch.stack(gproj_list, dim=0))
+            # Gravity projection (body frame): g_body = R(q)^T @ g_world, batched
+            q_b = env.srbd_q
+            R_b = quat_to_rot(q_b[:, 0], q_b[:, 1], q_b[:, 2], q_b[:, 3], env.device)  # (B,3,3)
+            g_w = torch.tensor([0.0, 0.0, -env.cfg.g], dtype=torch.float32, device=env.device)
+            gproj_hist.append(torch.einsum('bji,j->bi', R_b, g_w))  # (B,3)
 
             tilt_hist.append(0.7*torch.abs(env.pitch) + 0.3*torch.abs(env.roll))  # (B,)
 
-            # Reward (per-env, then average)
-            v_body_dbg_list = []
-            for b in range(B):
-                R_bw_dbg = quat_to_rot(env.srbd_q[b][0], env.srbd_q[b][1],
-                                       env.srbd_q[b][2], env.srbd_q[b][3], env.device)
-                v_body_dbg_list.append(R_bw_dbg.t().matmul(v_hat3[b]))
-            v_body_dbg = torch.stack(v_body_dbg_list, dim=0)  # (B,3)
+            # Reward (per-env, then average): v_body = R(q)^T @ v_world, batched
+            v_body_dbg = torch.einsum('bji,bj->bi', R_b, v_hat3)  # (B,3)
 
             r_v = -(env.vx_star - v_body_dbg[:,0]).abs()      # (B,)
             r_u = -0.01 * a.detach().pow(2).mean(dim=1)       # (B,)
@@ -274,21 +262,12 @@ def train(num_iters=1000, steps_per_iter=24,
 
 
             T_steps = v_world_seq.shape[0]
-            v_body_seq = torch.zeros_like(v_world_seq)
 
-            # World -> body frame linear velocity
-            for t_idx in range(T_steps):
-                for b in range(B):
-                    qw,qx,qy,qz = q_seq[t_idx, b]
-                    R_bw = quat_to_rot(qw,qx,qy,qz, device)
-                    #v_body_seq[t_idx, b] = R_bw.t().matmul(v_world_seq[t_idx, b])
-
-                    #-------------------------------------------------
-                    v_b_raw = R_bw.t().matmul(v_world_seq[t_idx, b])
-                    v_body_seq[t_idx, b] = v_b_raw
-                    # [Important fix] Force X-axis direction flip to match your vx_star = +0.486 setting
-                    #v_body_seq[t_idx, b, 0] = v_b_raw[0]
-                    #-------------------------------------------------
+            # World -> body frame linear velocity (batched over T and B)
+            q_flat = q_seq.reshape(T_steps * B, 4)
+            v_flat = v_world_seq.reshape(T_steps * B, 3)
+            R_flat = quat_to_rot(q_flat[:, 0], q_flat[:, 1], q_flat[:, 2], q_flat[:, 3], device)  # (T*B,3,3)
+            v_body_seq = torch.einsum('bji,bj->bi', R_flat, v_flat).reshape(T_steps, B, 3)
 
 
             # ★ v_ref: use historical [vx_cmd, vy_cmd]

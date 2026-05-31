@@ -16,6 +16,7 @@ single_dog_training/
 ├── train.py               # Training main loop
 ├── play_many_dog.py       # Policy playback script
 ├── setup.py               # Build script for the SRBD CUDA extension
+├── test_srbd_kernel.py    # Forward/backward parity test for the CUDA kernel
 └── src/
     ├── srbd_ext.cpp       # pybind11 bindings for the CUDA kernel
     └── srbd_cuda.cu       # Fused CUDA kernel: foot FK + SRBD dynamics step
@@ -202,7 +203,11 @@ CUDA_KERNEL_SRBD = False   # PyTorch (default — always works, no build step)
 CUDA_KERNEL_SRBD = True    # Custom fused CUDA kernel (requires building the extension)
 ```
 
-When `True`, `srbd.py` imports the compiled `srbd_cuda_ext` module and dispatches the forward pass through a single fused kernel in `src/srbd_cuda.cu` (foot FK + force/torque accumulation + Newton-Euler dynamics + quaternion integration, all in one launch). Backward is implemented via a `torch.autograd.Function` wrapper (`SRBDStepFunction`) that re-runs the PyTorch reference and uses `torch.autograd.grad` to compute exact gradients — so loss.backward() works identically under both backends, and gradients propagate through the SRBD state across the full rollout (matching the pure-PyTorch behavior).
+When `True`, `srbd.py` imports the compiled `srbd_cuda_ext` module and dispatches both directions through a `torch.autograd.Function` wrapper (`SRBDStepFunction`):
+- **Forward** is a single fused kernel in `src/srbd_cuda.cu` (foot FK + force/torque accumulation + Newton-Euler dynamics + quaternion integration), one thread per environment.
+- **Backward** is a hand-written analytic adjoint kernel in the same file — no PyTorch replay, no `torch.autograd.grad` re-execution. It recomputes the forward intermediates and applies the chain rule directly, returning gradients for all six tensor inputs (`p, v, q, w, f_world, q_ref12`).
+
+`loss.backward()` works identically under both backends. Gradients propagate through the SRBD state across the full rollout, matching the pure-PyTorch behavior. The kernel is built with `--use_fast_math`, so gradients agree with the PyTorch path to ≈ 1e-4 absolute (1-2 ULP per `sinf`/`cosf`/`rsqrtf` call, accumulated through the chain).
 
 If the extension is not built, the code prints a warning and silently falls back to the PyTorch path, so toggling the flag is always safe.
 
@@ -252,6 +257,42 @@ If the extension is missing or fails to import, you will instead see:
 [SRBD]          Falling back to PyTorch implementation.
 [SRBD]          Run: python setup.py build_ext --inplace
 ```
+
+### Testing the kernel
+
+After every rebuild, run the parity test to verify the CUDA kernel matches the PyTorch reference path on the same inputs:
+
+```bash
+python test_srbd_kernel.py
+```
+
+The test runs three checks and exits with code 0 on success:
+
+1. **Forward parity** — compares `srbd_step_forward` (CUDA) against an inline copy of the inline PyTorch path from `srbd.py:_srbd_step` on a random batch (B = 16). Tolerance `atol=1e-4, rtol=1e-3`.
+2. **Backward parity** — builds random upstream gradients, runs `torch.autograd.backward` on the PyTorch reference, calls `srbd_step_backward` (CUDA) directly, and compares all six input gradients (`p, v, q, w, f_world, q_ref12`). Tolerance `atol=1e-3, rtol=1e-2`.
+3. **Autograd wrapper round-trip** — calls `SRBDStepFunction.apply(...)` end-to-end, runs `.backward()` on a weighted sum of outputs, and compares `.grad` of each input against the PyTorch reference. This catches bugs in how the wrapper plumbs `ctx`/`needs_input_grad`, not just in the kernel.
+
+Expected output:
+
+```
+[1/3] Forward parity (atol=1e-4, rtol=1e-3)
+  [OK ] p_new        max abs 1.xx e-06  max rel 1.xx e-06
+  ...
+[2/3] Backward parity, direct ext call (atol=1e-3, rtol=1e-2)
+  [OK ] g_p          max abs 5.xx e-06  max rel 1.xx e-05
+  ...
+[3/3] SRBDStepFunction.apply round-trip (atol=1e-3, rtol=1e-2)
+  ...
+All SRBD kernel tests passed.
+```
+
+Per-tensor max absolute and max relative diff is printed for every check, so a failing line tells you which gradient drifted and by how much. Concrete numbers depend on GPU + driver; **orders of magnitude are what matter**. Drift around `1e-3` on `g_q_ref12` is the expected fast-math hit on the per-foot `sinf`/`cosf` chain — it is not a regression. Drift above the printed tolerances indicates one of:
+
+- The extension wasn't rebuilt after a `.cu`/`.cpp` change (re-run `python setup.py build_ext --inplace`).
+- A real math error was introduced in the kernel.
+- You want bit-tighter parity than fast-math allows — drop `--use_fast_math` from the `nvcc` flags in `setup.py` and rebuild; the test should then pass with much smaller residuals (cost: marginally slower forward/backward).
+
+The test requires the extension to be built and a CUDA-capable GPU. It does **not** depend on Isaac Gym and does **not** read `config.py` — the dispatch toggle is bypassed internally so the kernel itself is always exercised.
 
 ### When to enable it
 
