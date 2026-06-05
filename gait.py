@@ -430,16 +430,18 @@ class GaitPlanner:
         mix = torch.clamp(mix, 0.0, 1.0)                            # (B,4,1)
 
         flat = mix.view(B, 4)
-        # per-env enforce minimum support feet count (running/bound/gallop when min_feet_B=0, won't add feet => can have aerial phase)
-        for b in range(B):
-            k = int(min_feet_B[b].item())
-            if k <= 0:
-                continue
-            if float(flat[b].sum()) < k:
-                topk = torch.topk(flat[b], k=k).indices
-                out = torch.zeros_like(flat[b])
-                out[topk] = 1.0
-                flat[b] = out
+        # Per-env enforce minimum support feet count, vectorized (running/bound/
+        # gallop have min_feet_B=0 => never forced => aerial phase preserved).
+        # For envs with fewer than k stance feet, force the top-k legs to stance.
+        # A stable descending sort breaks ties toward the lower leg index (FL<FR<
+        # RL<RR), matching the per-env torch.topk fallback this replaces.
+        min_feet_f = min_feet_B.to(flat.dtype)                          # (B,)
+        needs = flat.sum(dim=1) < min_feet_f                            # (B,) ; k=0 -> never
+        _, order = torch.sort(flat, dim=1, descending=True, stable=True)  # (B,4)
+        rank = torch.zeros_like(order)
+        rank.scatter_(1, order, torch.arange(4, device=dev).view(1, 4).expand(B, 4))
+        forced = (rank < min_feet_B.view(B, 1)).to(flat.dtype)         # (B,4) one-hot top-k
+        flat = torch.where(needs.view(B, 1), forced, flat)             # (B,4)
         return flat.view(B, 4, 1)
 
     # ---------------- PD -> foot forces ----------------

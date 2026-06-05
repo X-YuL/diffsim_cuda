@@ -7,7 +7,6 @@ except Exception as e:
     print("[Warning] Isaac Gym import failed:", repr(e))
 
 import math
-import random
 from typing import Optional
 
 import numpy as np
@@ -28,7 +27,6 @@ from gait import GaitPlanner
 from srbd import SRBDModel
 from terrain import _setup_physx_stable, create_ground_plane, create_random_rough_terrain
 from utils_math import (
-    project_gravity_to_body,
     quat_from_rpy,
     quat_rotate_inverse_wxyz,
 )
@@ -520,28 +518,24 @@ class RealQuadEnv:
                 break
         else:
             self.phase = phase_try  # If really can't find, accept it (usually won't reach here)
-        # 3) Random yaw for each env
-        yaws = torch.empty(self.B, device=dev)
-        for i in range(self.B):
-            yaws[i] = random.uniform(-math.pi, math.pi)
+        # 3) Random yaw for each env (batched)
+        yaws = torch.empty(self.B, device=dev).uniform_(-math.pi, math.pi)
         self.last_reset_yaw = yaws.clone()
 
-        # root state
+        # root state (batched write over all envs)
         self.gym.refresh_actor_root_state_tensor(self.sim)
-        for i in range(self.B):
-            root = self.root_state[i]
-
-            ox, oy, oz = self.env_origins[i]
-            root[0] = float(ox.item())
-            root[1] = float(oy.item())
-            root[2] = float(oz.item()) + self.cfg.h0
-            q = quat_from_rpy(0.0, 0.0, float(yaws[i].item()))
-            root[3] = q.x
-            root[4] = q.y
-            root[5] = q.z
-            root[6] = q.w
-            root[7:10] = 0.0
-            root[10:13] = 0.0
+        # position = env origin, raised by h0 in z
+        self.root_state[:, 0] = self.env_origins[:, 0]
+        self.root_state[:, 1] = self.env_origins[:, 1]
+        self.root_state[:, 2] = self.env_origins[:, 2] + self.cfg.h0
+        # yaw-only quaternion, Isaac xyzw order: qx=qy=0, qz=sin(yaw/2), qw=cos(yaw/2)
+        half = 0.5 * yaws
+        self.root_state[:, 3] = 0.0
+        self.root_state[:, 4] = 0.0
+        self.root_state[:, 5] = torch.sin(half)
+        self.root_state[:, 6] = torch.cos(half)
+        # zero linear + angular velocity
+        self.root_state[:, 7:13] = 0.0
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_state))
 
         # 3) Body forward target velocity vx_star (B,)
@@ -582,20 +576,16 @@ class RealQuadEnv:
             self.gym.simulate(self.sim)
             self.gym.fetch_results(self.sim, True)
 
-        # 5) Engineering version: give a little initial forward velocity
+        # 5) Engineering version: give a little initial forward velocity (batched)
         if not PURE_PAPER_MODE:
             self.gym.refresh_actor_root_state_tensor(self.sim)
-            for i in range(self.B):
-                root = self.root_state[i]
-                v0_body = 0.10
-                if hasattr(self, "stop_cmd_mask") and bool(self.stop_cmd_mask[i].item()):
-                    v0_body = 0.0
-                yaw = float(self.last_reset_yaw[i].item())
-                vx_world = v0_body * math.cos(yaw)
-                vy_world = v0_body * math.sin(yaw)
-                root[7] = vx_world
-                root[8] = vy_world
-                root[9] = 0.0
+            v0_body = torch.full((self.B,), 0.10, device=dev)
+            if hasattr(self, "stop_cmd_mask"):
+                v0_body = torch.where(self.stop_cmd_mask.bool(), torch.zeros_like(v0_body), v0_body)
+            yaw = self.last_reset_yaw
+            self.root_state[:, 7] = v0_body * torch.cos(yaw)
+            self.root_state[:, 8] = v0_body * torch.sin(yaw)
+            self.root_state[:, 9] = 0.0
             self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_state))
 
         # 6) Refresh cache & SRBD initialization
@@ -713,28 +703,22 @@ class RealQuadEnv:
         # 3) Random yaw & root state (base pose + vel) for these robots
         self.gym.refresh_actor_root_state_tensor(self.sim)
 
-        # Random yaw
-        yaws = torch.empty(env_ids.numel(), device=dev)
-        for k in range(env_ids.numel()):
-            yaws[k] = random.uniform(-math.pi, math.pi)
+        # Random yaw (batched)
+        yaws = torch.empty(n, device=dev).uniform_(-math.pi, math.pi)
         self.last_reset_yaw[env_ids] = yaws.clone()
 
-        # Write back to root_state
-        for k, env_id in enumerate(env_ids):
-            i = int(env_id.item())
-            root = self.root_state[i]
-            ox, oy, oz = self.env_origins[i]
-            root[0] = float(ox.item())
-            root[1] = float(oy.item())
-            root[2] = float(oz.item()) + self.cfg.h0
-            q = quat_from_rpy(0.0, 0.0, float(yaws[k].item()))
-            root[3] = q.x
-            root[4] = q.y
-            root[5] = q.z
-            root[6] = q.w
-            # Clear linear velocity / angular velocity
-            root[7:10]  = 0.0
-            root[10:13] = 0.0
+        # Write back to root_state (batched over env_ids)
+        half = 0.5 * yaws
+        self.root_state[env_ids, 0] = self.env_origins[env_ids, 0]
+        self.root_state[env_ids, 1] = self.env_origins[env_ids, 1]
+        self.root_state[env_ids, 2] = self.env_origins[env_ids, 2] + self.cfg.h0
+        # yaw-only quaternion, Isaac xyzw order: qx=qy=0, qz=sin(yaw/2), qw=cos(yaw/2)
+        self.root_state[env_ids, 3] = 0.0
+        self.root_state[env_ids, 4] = 0.0
+        self.root_state[env_ids, 5] = torch.sin(half)
+        self.root_state[env_ids, 6] = torch.cos(half)
+        # Clear linear velocity / angular velocity
+        self.root_state[env_ids, 7:13] = 0.0
 
         self.gym.set_actor_root_state_tensor(
             self.sim, gymtorch.unwrap_tensor(self.root_state)
@@ -786,9 +770,9 @@ class RealQuadEnv:
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         
-        for env_id in env_ids.tolist():
-            self.dof_state_view[env_id, :, 0] = torch.as_tensor(self.q_default_full, device=dev)
-            self.dof_state_view[env_id, :, 1] = 0.0
+        base_q = torch.as_tensor(self.q_default_full, device=dev)
+        self.dof_state_view[env_ids, :, 0] = base_q.view(1, -1).expand(n, -1)
+        self.dof_state_view[env_ids, :, 1] = 0.0
 
         actor_ids = self.actor_indices_t[env_ids].to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(
@@ -900,16 +884,10 @@ class RealQuadEnv:
 
 
 
-        # Body frame velocity / angular velocity
-        base_lin_body = []
-        base_ang_body = []
-        for i in range(self.B):
-            v_b = quat_rotate_inverse_wxyz(self.base_quat[i], self.base_lin_world[i], self.device)
-            w_b = quat_rotate_inverse_wxyz(self.base_quat[i], self.base_ang_world[i], self.device)
-            base_lin_body.append(v_b)
-            base_ang_body.append(w_b)
-        self.base_lin_body = torch.stack(base_lin_body, dim=0)  # (B,3)
-        self.base_ang_body = torch.stack(base_ang_body, dim=0)  # (B,3)
+        # Body frame velocity / angular velocity (batched: quat_rotate_inverse_wxyz
+        # already supports (B,4)/(B,3) input, so no per-env loop is needed)
+        self.base_lin_body = quat_rotate_inverse_wxyz(self.base_quat, self.base_lin_world, self.device)  # (B,3)
+        self.base_ang_body = quat_rotate_inverse_wxyz(self.base_quat, self.base_ang_world, self.device)  # (B,3)
 
         # world frame alias
         self.base_lin = self.base_lin_world
@@ -1019,46 +997,40 @@ class RealQuadEnv:
         dev = self.device
         Kp, Kd = self.cfg.pd_kp, self.cfg.pd_kd
 
+        B = self.B
         tau = Kp * (q_ref12 - q_now12) - Kd * qd_now12  # (B,12)
-        tau = tau.view(self.B, 12, 1)
+        tau = tau.view(B, 12, 1)
 
         J_all = self.foot_jacobians()                   # (B,4,3,cols)
         dof_offset = getattr(self, "jac_dof_offset", 0)
         J12 = J_all[..., self.ctrl_idx_t + dof_offset]  # (B,4,3,12) columns corresponding to joint DOFs
 
-        f_list = []
-        I = torch.diag(torch.tensor(
-            [self.cfg.Ixx, self.cfg.Iyy, self.cfg.Izz], device=dev
-        ))
+        # ---- Batched stance-weighted Jacobian (replaces the per-env loop) ----
+        # Stack the 4 feet × 3 spatial rows into a (B,12,12) block, exactly like
+        # the old torch.cat([Jw[i] for i in range(4)], dim=0) but for all envs.
+        Jw   = J12 * stance_mask.view(B, 4, 1, 1)       # (B,4,3,12)
+        Jbig = Jw.reshape(B, 12, 12)                    # (B,12,12)
 
-        for b in range(self.B):
-            Jb = J12[b]                          # (4,3,12)
-            wmask = stance_mask[b].view(4,1,1)   # (4,1,1)
-            Jw = Jb * wmask                      # (4,3,12)
+        # ---- Damped-pseudo-inverse solve in float64 for precision ----
+        # (.double()/.float() are differentiable, so the policy -> q_ref12 -> tau
+        #  -> f autograd path is preserved; float64 removes batched-vs-loop drift.)
+        JJt = (Jbig @ Jbig.transpose(-1, -2)).double()  # (B,12,12)
+        rhs = (Jbig @ tau).double()                     # (B,12,1)
+        eye = torch.eye(12, device=dev, dtype=torch.float64)            # broadcasts over batch
+        U, S, Vh = torch.linalg.svd(JJt + 1e-9 * eye)   # (B,12,12)/(B,12)/(B,12,12)
+        S = torch.clamp(S, min=1e-3)
+        Ainv = U @ torch.diag_embed(1.0 / S) @ Vh       # (B,12,12)
+        y = Ainv @ rhs                                  # (B,12,1)
+        f = (-y.view(B, 4, 3)).float()                  # (B,4,3)
 
-            Jbig = torch.cat([Jw[i] for i in range(4)], dim=0)  # (12,12)
-            JJt  = Jbig @ Jbig.T
-            rhs  = Jbig @ tau[b]                                # (12,1)
-
-            U, S, Vh = torch.linalg.svd(JJt + 1e-9*torch.eye(12, device=dev))
-            S = torch.clamp(S, min=1e-3)
-            Ainv = U @ torch.diag_embed(1.0/S) @ Vh
-            y = Ainv @ rhs
-            #f_b = y.view(4,3)
-            f_b = -y.view(4,3)
-
-            # Friction cone + Fz clamping
-            fz = f_b[:, 2:3]
-            fz = torch.clamp(fz, min=self.cfg.fz_min, max=self.cfg.fz_max) * stance_mask[b]
-            ft = f_b[:, :2]
-            ft_norm = torch.linalg.norm(ft, dim=-1, keepdim=True)
-            ft_max = self.cfg.mu_tangent * fz
-            scale = torch.clamp(ft_max / (ft_norm + 1e-6), max=1.0)
-            ft = ft * scale
-            f_b = torch.cat([ft, fz], dim=-1)   # (4,3)
-            f_list.append(f_b)
-
-        f = torch.stack(f_list, dim=0)  # (B,4,3)
+        # ---- Friction cone + Fz clamping (batched) ----
+        fz = torch.clamp(f[..., 2:3], min=self.cfg.fz_min, max=self.cfg.fz_max) * stance_mask  # (B,4,1)
+        ft = f[..., :2]                                 # (B,4,2)
+        ft_norm = torch.linalg.norm(ft, dim=-1, keepdim=True)          # (B,4,1)
+        ft_max = self.cfg.mu_tangent * fz                              # (B,4,1)
+        scale = torch.clamp(ft_max / (ft_norm + 1e-6), max=1.0)        # (B,4,1)
+        ft = ft * scale                                 # (B,4,2)
+        f = torch.cat([ft, fz], dim=-1)                 # (B,4,3)
         return f
 
     # ---------------- SRBD ----------------
@@ -1359,11 +1331,10 @@ class RealQuadEnv:
         q_wxyz = self.base_quat                              # (B,4)
         w_b  = self.base_ang_body                            # (B,3)
 
-        # Gravity projection (B,3)
-        g_list = []
-        for b in range(B):
-            g_list.append(project_gravity_to_body(q_wxyz[b], cfg.g, dev))
-        g_proj = torch.stack(g_list, dim=0)
+        # Gravity projection (B,3): g_body = R(q)^T @ g_world, which is exactly
+        # what the batched quat_rotate_inverse_wxyz computes -> no per-env loop.
+        g_w = torch.tensor([0.0, 0.0, -cfg.g], dtype=torch.float32, device=dev).view(1, 3).expand(B, 3)
+        g_proj = quat_rotate_inverse_wxyz(q_wxyz, g_w, dev)  # (B,3)
 
 
         q_now_sim = self.q[:, self.ctrl_idx_t].to(dev)      # sim convention
