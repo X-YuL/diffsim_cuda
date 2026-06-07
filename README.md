@@ -16,7 +16,9 @@ single_dog_training/
 ├── train.py               # Training main loop
 ├── play_many_dog.py       # Policy playback script
 ├── setup.py               # Build script for the SRBD CUDA extension
-├── test_srbd_kernel.py    # Forward/backward parity test for the CUDA kernel
+├── tests/
+│   ├── test_srbd_kernel.py    # Forward/backward parity test for the CUDA kernel
+│   └── test_vectorization.py  # Loop-vs-batched parity (foot forces, stance)
 └── src/
     ├── srbd_ext.cpp       # pybind11 bindings for the CUDA kernel
     └── srbd_cuda.cu       # Fused CUDA kernel: foot FK + SRBD dynamics step
@@ -81,10 +83,10 @@ pip install -e .
 # Basic training (1000 iterations, 24 steps each)
 python3 train.py
 
-# After training completes, the following files are generated:
-# - quad_diffsim_srbd_align_multi_robot.pth  (model weights)
-# - quad_diffsim_srbd_align_multi_robot.pt   (TorchScript model for deployment)
-# - Various training curves (loss_*.png, vx_curve_*.png, etc.)
+# After training completes, the following files are generated in the results/ folder:
+# - results/quad_diffsim_srbd_align_multi_robot.pth  (model weights)
+# - results/quad_diffsim_srbd_align_multi_robot.pt   (TorchScript model for deployment)
+# - results/ Various training curves (loss_*.png, vx_curve_*.png, etc.)
 ```
 
 ### Playing Trained Policy
@@ -141,21 +143,22 @@ Main configuration in `EnvCfg` class in `config.py`:
 
 ## Training Output
 
-After training completes, the following files are generated:
+After training completes, the following files are generated in the `results/` folder
+(this folder is git-ignored — only source code, the README and the URDF are tracked):
 
 ### Model Files
-- `quad_diffsim_srbd_align_multi_robot.pth`: PyTorch model weights
-- `quad_diffsim_srbd_align_multi_robot.pt`: TorchScript model (for ROS2 deployment)
+- `results/quad_diffsim_srbd_align_multi_robot.pth`: PyTorch model weights
+- `results/quad_diffsim_srbd_align_multi_robot.pt`: TorchScript model (for ROS2 deployment)
 
 ### Training Curves
-- `loss_curve_srbd_align.png`: Total loss curve
-- `loss_components_curve_srbd_align.png`: Individual loss components
-- `vx_curve_srbd_align.png`: Body forward velocity curve
-- `vx_curve_srbd_align_smooth.png`: Smoothed velocity curve
-- `reward_curve_srbd_align.png`: Reward curve
+- `results/loss_curve_srbd_align.png`: Total loss curve
+- `results/loss_components_curve_srbd_align.png`: Individual loss components
+- `results/vx_curve_srbd_align.png`: Body forward velocity curve
+- `results/vx_curve_srbd_align_smooth.png`: Smoothed velocity curve
+- `results/reward_curve_srbd_align.png`: Reward curve
 
 ### Data Files
-- `*.npy`: NumPy arrays of various metrics (for post-analysis)
+- `results/*.npy`: NumPy arrays of various metrics (for post-analysis)
 
 ## Code Architecture
 
@@ -263,7 +266,7 @@ If the extension is missing or fails to import, you will instead see:
 After every rebuild, run the parity test to verify the CUDA kernel matches the PyTorch reference path on the same inputs:
 
 ```bash
-python test_srbd_kernel.py
+python tests/test_srbd_kernel.py
 ```
 
 The test runs three checks and exits with code 0 on success:
@@ -305,6 +308,185 @@ The test requires the extension to be built and a CUDA-capable GPU. It does **no
 - A working PyTorch CUDA install (`python -c "import torch; print(torch.cuda.is_available())"` returns `True`).
 - A CUDA Toolkit on `PATH` matching your PyTorch build (`nvcc --version`).
 - A C++ compiler compatible with that PyTorch build (gcc/clang on Linux, MSVC Build Tools on Windows).
+
+## Profiling & Finding Bottlenecks (Linux)
+
+This project has two layers worth profiling separately:
+
+1. **The whole pipeline** — the Python training loop, Isaac Gym stepping, and all the PyTorch
+   ops (`train.py`, `env.py`, `gait.py`, the PyTorch SRBD path). This tells you *where* time goes:
+   CPU vs GPU, simulation vs policy vs loss/backward.
+2. **The custom CUDA kernels** — `foot_positions_kernel`, `srbd_step_kernel`,
+   `srbd_step_backward_kernel` in `src/srbd_cuda.cu` (active only when `CUDA_KERNEL_SRBD = True`).
+   This tells you *why* a kernel is slow (memory- vs compute-bound, occupancy).
+
+Work top-down: triage → whole-pipeline profile → zoom into the worst kernel. Don't start in
+Nsight Compute.
+
+### Three rules that make GPU profiling trustworthy
+
+- **Warm up first.** The first ~10–20 iterations include CUDA context creation, cuDNN/cuBLAS
+  autotuning, and lazy allocation. Always skip them, or your "hot spot" is just startup.
+- **CUDA is asynchronous.** Wall-clock timing around a GPU call measures only the *launch*, not
+  the work. Call `torch.cuda.synchronize()` before you read the clock, or use CUDA events. The
+  profilers below handle this for you.
+- **Profile a short, realistic run.** Edit the entry point in `train.py`
+  (`train(num_iters=1000, ...)`) down to e.g. `num_iters=50`, set `cfg.use_viewer = False`, and
+  profile at the `num_envs` you actually train at — kernel-launch overhead vs. compute balance
+  changes completely between 16 and 1000 envs.
+
+### Tools to install
+
+| Tool | Use it for | Install |
+|------|-----------|---------|
+| `py-spy` | Zero-code-change sampling profiler → flame graph of Python (and native) stacks | `pip install py-spy` |
+| `torch.profiler` | Per-op CPU **and** CUDA time, incl. the custom kernel; Chrome/TensorBoard trace | built into PyTorch |
+| `snakeviz` | Interactive viewer for `cProfile` output | `pip install snakeviz` |
+| `line_profiler` | Line-by-line timing of one hot function | `pip install line_profiler` |
+| **Nsight Systems** (`nsys`) | System-wide timeline: CPU↔GPU overlap, gaps, sync stalls, kernel launches | NVIDIA CUDA Toolkit / [developer.nvidia.com/nsight-systems](https://developer.nvidia.com/nsight-systems) |
+| **Nsight Compute** (`ncu`) | Deep per-kernel analysis (occupancy, memory throughput, warp stalls) | NVIDIA CUDA Toolkit / [developer.nvidia.com/nsight-compute](https://developer.nvidia.com/nsight-compute) |
+| `nvtop` | Live GPU/mem utilization (htop-style) | `sudo apt install nvtop` |
+
+### Step 1 — Triage: CPU-bound or GPU-bound?
+
+Run training in one terminal and watch the GPU in another:
+
+```bash
+nvtop                       # or: watch -n 0.5 nvidia-smi
+nvidia-smi dmon -s u        # utilization sampled over time (good for logging)
+```
+
+- **GPU util pinned near 100%** → you're GPU-bound; go to Steps 3–5 (kernels / GPU ops).
+- **GPU util low and spiky** → you're CPU-bound or sync-bound (Python overhead, Isaac Gym CPU
+  work, host↔device copies); Step 2 (py-spy) will show it fastest.
+
+### Step 2 — Whole-pipeline profiling
+
+**py-spy (start here — no code changes).** Sampling profiler; produces a flame graph.
+
+```bash
+# Profile a fresh run end-to-end:
+py-spy record --native -o results/pyspy_train.svg -- python train.py
+# --native also shows C/C++/CUDA-launch frames, not just Python.
+
+# Or attach to an already-running training process (may need sudo for ptrace):
+py-spy record --native -o results/pyspy_train.svg --pid <PID>
+
+# Live, top-style view:
+py-spy top -- python train.py
+```
+
+Open the `.svg` in a browser; the widest bars are where wall-clock time is spent.
+
+**torch.profiler (per-op CPU + CUDA breakdown, incl. the SRBD kernel).** Wrap the iteration loop
+in `train.py`. The `schedule` skips warmup automatically:
+
+```python
+from torch.profiler import profile, schedule, ProfilerActivity, tensorboard_trace_handler
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    schedule=schedule(wait=5, warmup=5, active=10, repeat=1),
+    on_trace_ready=tensorboard_trace_handler("./results/torch_profiler"),
+    record_shapes=True, with_stack=True,
+) as prof:
+    for it in pbar:                 # the existing outer training loop
+        ...                         # one full iteration (rollout + loss + step)
+        prof.step()                 # MUST be called once per iteration
+
+# Print the top ops to the console:
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25))
+```
+
+View the timeline with `tensorboard --logdir results/torch_profiler`, or open the generated
+`.json` trace in `chrome://tracing` / [ui.perfetto.dev](https://ui.perfetto.dev). The custom
+kernels appear by name (`srbd_step_kernel`, etc.); high `cuda_time_total` for `aten::*` ops points
+at the PyTorch SRBD path or Isaac Gym tensors instead.
+
+**cProfile + snakeviz (Python-only; ignores async GPU time — use only for CPU hotspots):**
+
+```bash
+python -m cProfile -o results/train.prof train.py
+snakeviz results/train.prof
+```
+
+**line_profiler (one suspicious function).** Add `@profile` above a hot function (e.g.
+`RealQuadEnv.step`, `estimate_foot_forces`, or `_update_foot_targets_from_command`) and run:
+
+```bash
+kernprof -l -v train.py
+```
+
+### Step 3 — System timeline with Nsight Systems (`nsys`)
+
+The best view of how CPU, Isaac Gym, PyTorch, and your kernels interleave — and where the GPU
+sits idle waiting on the host.
+
+```bash
+nsys profile \
+  --trace=cuda,nvtx,osrt,cublas,cudnn \
+  --cuda-memory-usage=true \
+  --output=results/nsys_train \
+  python train.py
+```
+
+Open `results/nsys_train.nsys-rep` in `nsys-ui`. Look for: gaps on the GPU rows (CPU-bound),
+frequent `cudaStreamSynchronize`/`cudaMemcpy` (sync/copy stalls), and which kernels dominate.
+
+**Annotate regions** so the timeline is readable — add NVTX ranges in `train.py`:
+
+```python
+import torch.cuda.nvtx as nvtx
+nvtx.range_push("rollout");   ...inner step loop...   ; nvtx.range_pop()
+nvtx.range_push("loss");      ...compute loss...       ; nvtx.range_pop()
+nvtx.range_push("backward");  loss.backward();         ; nvtx.range_pop()
+```
+
+(Or wrap the whole loop in `with torch.autograd.profiler.emit_nvtx():` to auto-label every torch op.)
+
+### Step 4 — Per-kernel deep dive with Nsight Compute (`ncu`)
+
+Once `nsys`/`torch.profiler` names the worst kernel, analyze just that one. `ncu` *replays* each
+kernel many times, so it's slow — always restrict the launches:
+
+```bash
+sudo ncu \
+  --kernel-name "regex:srbd_step_kernel|srbd_step_backward_kernel|foot_positions_kernel" \
+  --launch-skip 200 --launch-count 6 \
+  --set full \
+  --export results/ncu_srbd \
+  python train.py
+```
+
+Open `results/ncu_srbd.ncu-rep` in `ncu-ui`. The report tells you directly whether the kernel is
+**memory-bound** or **compute-bound**, plus achieved occupancy and warp-stall reasons — that's
+your shopping list for `src/srbd_cuda.cu`.
+
+> Note: reading GPU performance counters usually needs elevated privileges — run `ncu` with
+> `sudo`, or have an admin set `NVreg_RestrictProfilingToAdminUsers=0` (the error message links to
+> [this page](https://developer.nvidia.com/ERR_NVGPUCTRPERM) if you hit it).
+
+### Step 5 — Does the CUDA kernel actually help?
+
+Because the SRBD step has a PyTorch reference path, you can A/B test the kernel. Time a short run
+each way (toggle `CUDA_KERNEL_SRBD` in `config.py`) at your real `num_envs`:
+
+```python
+import time, torch
+torch.cuda.synchronize(); t0 = time.perf_counter()
+# ... run N warmed-up iterations ...
+torch.cuda.synchronize(); print(f"{N} iters: {time.perf_counter() - t0:.3f}s")
+print("peak GPU mem (MB):", torch.cuda.max_memory_allocated() / 1e6)
+```
+
+If `True` (custom kernel) isn't meaningfully faster than `False` (PyTorch) at your `num_envs`, the
+kernel isn't the bottleneck — re-check Step 2/3 before optimizing `src/srbd_cuda.cu`.
+
+### Suggested loop
+
+`nvtop` (triage) → `py-spy` + `torch.profiler` (find the hot region) → `nsys` (see why the GPU
+waits) → `ncu` (fix the specific kernel) → re-measure with Step 5. Save each report under
+`results/` (already git-ignored) so you can compare before/after.
 
 ## Debugging Features
 
@@ -351,10 +533,13 @@ A:
 3. Turn off `use_viewer` (don't render during training)
 4. Use a faster GPU
 
+To find the *actual* bottleneck instead of guessing, see
+[Profiling & Finding Bottlenecks](#profiling--finding-bottlenecks-linux).
+
 ### Q: How to deploy to real robot?
 A: After training, use the TorchScript model:
 ```python
-model = torch.jit.load("quad_diffsim_srbd_align_multi_robot.pt")
+model = torch.jit.load("results/quad_diffsim_srbd_align_multi_robot.pt")
 action = model(observation)  # (1, 36) -> (1, 12)
 ```
 

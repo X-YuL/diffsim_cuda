@@ -27,6 +27,9 @@ from utils_math import (
     set_seed,
 )
 
+# Directory for all training outputs (curves, metrics, model weights).
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+
 
 def train(num_iters=1000, steps_per_iter=24,
           device="cuda" if torch.cuda.is_available() else "cpu",
@@ -409,20 +412,23 @@ def train(num_iters=1000, steps_per_iter=24,
 
 
     # ===== Save curves =====
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    def out(fn): return os.path.join(RESULTS_DIR, fn)
+
     V = np.array(vx_iter_track, dtype=np.float32)
     S = steps_per_iter
 
-    np.save("vx_curve_srbd_align.npy", V)
+    np.save(out("vx_curve_srbd_align.npy"), V)
     plt.figure(); plt.plot(V)
     plt.xlabel("Training Iteration"); plt.ylabel(f"Avg body vx over {S} steps (m/s)")
-    plt.tight_layout(); plt.savefig("vx_curve_srbd_align.png")
+    plt.tight_layout(); plt.savefig(out("vx_curve_srbd_align.png"))
 
     plt.figure(); plt.plot(moving_average(V, smooth_k))
     plt.xlabel("Training Iteration"); plt.ylabel("Avg body vx (moving avg)")
-    plt.tight_layout(); plt.savefig("vx_curve_srbd_align_smooth.png")
+    plt.tight_layout(); plt.savefig(out("vx_curve_srbd_align_smooth.png"))
 
     plt.figure(); plt.plot(losses); plt.xlabel("Iteration"); plt.ylabel("Loss")
-    plt.tight_layout(); plt.savefig("loss_curve_srbd_align.png")
+    plt.tight_layout(); plt.savefig(out("loss_curve_srbd_align.png"))
 
     loss_parts = {
         "loss_v":     np.array(loss_v_hist_iter,     dtype=np.float32),
@@ -434,13 +440,13 @@ def train(num_iters=1000, steps_per_iter=24,
     }
 
     for name, arr in loss_parts.items():
-        np.save(f"{name}_srbd_align.npy", arr)
+        np.save(out(f"{name}_srbd_align.npy"), arr)
         plt.figure()
         plt.plot(arr)
         plt.xlabel("Iteration")
         plt.ylabel(name)
         plt.tight_layout()
-        plt.savefig(f"{name}_curve_srbd_align.png")
+        plt.savefig(out(f"{name}_curve_srbd_align.png"))
 
     plt.figure()
     for name, arr in loss_parts.items():
@@ -449,14 +455,14 @@ def train(num_iters=1000, steps_per_iter=24,
     plt.ylabel("Loss components")
     plt.legend()
     plt.tight_layout()
-    plt.savefig("loss_components_curve_srbd_align.png")
+    plt.savefig(out("loss_components_curve_srbd_align.png"))
 
-    R = np.array(rewards, dtype=np.float32); np.save("rewards_srbd_align.npy", R)
+    R = np.array(rewards, dtype=np.float32); np.save(out("rewards_srbd_align.npy"), R)
     plt.figure(); plt.plot(moving_average(R, smooth_k))
     plt.xlabel("Training Iteration"); plt.ylabel("Reward (moving avg)")
-    plt.tight_layout(); plt.savefig("reward_curve_srbd_align.png")
+    plt.tight_layout(); plt.savefig(out("reward_curve_srbd_align.png"))
 
-    torch.save(model.state_dict(), "quad_diffsim_srbd_align_multi_robot.pth")
+    torch.save(model.state_dict(), out("quad_diffsim_srbd_align_multi_robot.pth"))
     # ===== Additional TorchScript export (for ROS2 deployment) =====
     model.eval()
 
@@ -472,8 +478,8 @@ def train(num_iters=1000, steps_per_iter=24,
 
     example_obs = torch.zeros(1, 36, device=device)  # Your DiffSim obs_dim=36
     traced = torch.jit.trace(wrapper, example_obs)
-    traced.save("quad_diffsim_srbd_align_multi_robot.pt")
-    print("✅ Saved TorchScript: quad_diffsim_srbd_align_multi_robot.pt")
+    traced.save(out("quad_diffsim_srbd_align_multi_robot.pt"))
+    print(f"✅ Saved TorchScript: {out('quad_diffsim_srbd_align_multi_robot.pt')}")
     # ===== Additional TorchScript export (for ROS2 deployment) =====
 
     print("✅ Training done (MULTI robot SRBD + α-align, Eq.(5) loss, body-frame vx tracking).")

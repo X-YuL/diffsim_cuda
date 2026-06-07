@@ -47,7 +47,7 @@ def main():
     parser.add_argument(
         "--weights",
         type=str,
-        default="quad_diffsim_srbd_align_multi_robot.pth",
+        default=os.path.join("results", "quad_diffsim_srbd_align_multi_robot.pth"),
         help="Policy weight file path (default: pth saved by training script)"
     )
     parser.add_argument(
