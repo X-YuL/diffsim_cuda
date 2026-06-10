@@ -109,6 +109,16 @@ python3 play_many_dog.py --weights your_model.pth
 
 # Run for specified steps then stop
 python3 play_many_dog.py --max_steps 1000
+
+# SSH/headless playback with MP4 recording
+python3 play_many_dog.py \
+  --no_viewer \
+  --record_video videos/policy.mp4 \
+  --weights results/quad_diffsim_srbd_align_multi_robot.pth \
+  --num_envs 4 \
+  --gait_mode 1 \
+  --no_rand_cmd \
+  --max_steps 5000
 ```
 
 ## Configuration

@@ -12,6 +12,8 @@ Usage examples:
 
 import os
 import argparse
+import shutil
+import subprocess
 
 # ⚠️ CRITICAL: Isaac Gym must be imported BEFORE torch
 try:
@@ -24,6 +26,57 @@ import torch
 from config import EnvCfg, PURE_PAPER_MODE
 from env import RealQuadEnv
 from policy import Policy
+
+
+class FfmpegVideoWriter:
+    def __init__(self, path: str, width: int, height: int, fps: int):
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError("ffmpeg was not found on PATH; install ffmpeg to record MP4 video.")
+
+        self.path = path
+        self.width = int(width)
+        self.height = int(height)
+        self.frames = 0
+
+        out_dir = os.path.dirname(os.path.abspath(path))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-loglevel", "error",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", f"{self.width}x{self.height}",
+            "-r", str(int(fps)),
+            "-i", "-",
+            "-an",
+            "-vcodec", "libx264",
+            "-preset", "fast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            path,
+        ]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def write(self, frame):
+        if frame.shape != (self.height, self.width, 3):
+            raise ValueError(f"Expected frame shape {(self.height, self.width, 3)}, got {frame.shape}")
+        try:
+            self.proc.stdin.write(frame.tobytes())
+            self.frames += 1
+        except BrokenPipeError as exc:
+            raise RuntimeError("ffmpeg stopped while writing video frames.") from exc
+
+    def close(self):
+        if self.proc.stdin and not self.proc.stdin.closed:
+            self.proc.stdin.close()
+        stderr = self.proc.stderr.read().decode("utf-8", "replace") if self.proc.stderr else ""
+        ret = self.proc.wait()
+        if ret != 0:
+            raise RuntimeError(f"ffmpeg failed with exit code {ret}: {stderr.strip()}")
 
 
 def load_policy(weight_path: str,
@@ -79,9 +132,57 @@ def main():
         default=0,
         help="Maximum steps to run; 0 means run indefinitely until viewer is closed"
     )
+    parser.add_argument(
+        "--no_viewer",
+        action="store_true",
+        help="Run without the Isaac Gym viewer; useful for SSH/headless recording"
+    )
+    parser.add_argument(
+        "--record_video",
+        type=str,
+        default="",
+        help="Write an MP4 video to this path using an Isaac Gym camera sensor"
+    )
+    parser.add_argument(
+        "--video_width",
+        type=int,
+        default=1280,
+        help="Recording width in pixels"
+    )
+    parser.add_argument(
+        "--video_height",
+        type=int,
+        default=720,
+        help="Recording height in pixels"
+    )
+    parser.add_argument(
+        "--video_fps",
+        type=int,
+        default=50,
+        help="Frames per second for the output video"
+    )
+    parser.add_argument(
+        "--video_every",
+        type=int,
+        default=10,
+        help="Capture one video frame every N simulation steps"
+    )
+    parser.add_argument(
+        "--fixed_camera",
+        action="store_true",
+        help="Use the fixed overview camera for recording instead of following robot 0"
+    )
+    parser.add_argument(
+        "--asset_root",
+        type=str,
+        default=None,
+        help="Directory containing go2_description.urdf and dae/ assets"
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
+    if args.record_video and args.video_every <= 0:
+        raise ValueError("--video_every must be positive when recording video.")
 
     # -------- Build EnvCfg --------
     cfg = EnvCfg()
@@ -89,9 +190,12 @@ def main():
     if args.num_envs is not None:
         cfg.num_envs = args.num_envs
 
-    # Play mode: must enable viewer
-    cfg.use_viewer = True
+    # Play mode: viewer is optional when using the off-screen recorder
+    viewer_requested = not args.no_viewer
+    cfg.use_viewer = viewer_requested
     cfg.use_gpu_pipeline = True
+    if args.asset_root is not None:
+        cfg.asset_root = args.asset_root
 
     # Velocity command switch
     if args.no_rand_cmd:
@@ -103,6 +207,21 @@ def main():
     # -------- Build environment & policy --------
     env = RealQuadEnv(cfg, device=device)
     env.reset()  # Initialize to “standing + random/fixed commands”
+
+    video_writer = None
+    if args.record_video:
+        env.create_recording_camera(
+            width=args.video_width,
+            height=args.video_height,
+            follow=not args.fixed_camera,
+        )
+        video_writer = FfmpegVideoWriter(
+            args.record_video,
+            width=args.video_width,
+            height=args.video_height,
+            fps=args.video_fps,
+        )
+        print(f"[video] Recording to {args.record_video} at {args.video_width}x{args.video_height}@{args.video_fps}fps")
 
     policy = load_policy(args.weights, device)
     B = env.B
@@ -118,7 +237,12 @@ def main():
 
     print("🎮 Starting DiffSim Quadruped multi-dog environment playback")
     print(f"   Number of parallel quadrupeds B = {B}")
-    print("   Tip: Move camera freely in Isaac Gym viewer window, close window to exit.")
+    if env.viewer is not None:
+        print("   Tip: Move camera freely in Isaac Gym viewer window, close window to exit.")
+    elif video_writer is not None:
+        print("   Viewer disabled; recording video from the Isaac Gym camera sensor.")
+        if args.max_steps <= 0:
+            print("   Note: --max_steps is 0, so stop the run with Ctrl+C when you have enough footage.")
 
     try:
         while True:
@@ -161,8 +285,11 @@ def main():
             t += 1
             steps_done += 1
 
+            if video_writer is not None and (steps_done % args.video_every) == 0:
+                video_writer.write(env.capture_recording_frame())
+
             # Exit if viewer is closed
-            if env.viewer is None:
+            if viewer_requested and env.viewer is None:
                 print("Viewer closed, exiting play.")
                 break
 
@@ -173,6 +300,10 @@ def main():
 
     except KeyboardInterrupt:
         print("Received Ctrl+C, exiting play.")
+    finally:
+        if video_writer is not None:
+            video_writer.close()
+            print(f"[video] Saved {video_writer.frames} frames to {args.record_video}.")
 
 
 if __name__ == "__main__":

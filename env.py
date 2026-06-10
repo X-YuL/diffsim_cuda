@@ -7,6 +7,7 @@ except Exception as e:
     print("[Warning] Isaac Gym import failed:", repr(e))
 
 import math
+import os
 from typing import Optional
 
 import numpy as np
@@ -159,7 +160,8 @@ class RealQuadEnv:
 
 
         # Load asset
-        ASSET_ROOT = "/home/jakub/projects/BachelorThesis"
+        asset_root = getattr(self.cfg, "asset_root", None) or os.environ.get("GO2_ASSET_ROOT") or os.getcwd()
+        ASSET_ROOT = os.path.abspath(os.path.expanduser(asset_root))
         ASSET_FILE = "go2_description.urdf"
 
         asset_opts = gymapi.AssetOptions()
@@ -384,6 +386,13 @@ class RealQuadEnv:
         self.cam_smooth = 0.15
         self._cam_eye = None
         self._cam_tgt = None
+
+        self.record_camera = None
+        self.record_camera_width = None
+        self.record_camera_height = None
+        self.record_camera_follow = True
+        self._record_cam_eye = None
+        self._record_cam_tgt = None
 
         # Initialize cache + gait/SRBD
         self.gait = GaitPlanner(self)
@@ -918,7 +927,9 @@ class RealQuadEnv:
         yaw = self._yaw_from_quat()
         back = np.array([-math.cos(yaw), -math.sin(yaw), 0.0])
         up   = np.array([0.0, 0.0, 1.0])
-        desired_eye = np.array([px, py, pz]) + self.cam_dist * back + self.cam_height * up
+        side = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
+        # desired_eye = np.array([px, py, pz]) + self.cam_dist * back + self.cam_height * up
+        desired_eye = np.array([px, py, pz]) + self.cam_dist * side + self.cam_height * up
         desired_tgt = np.array([px, py, pz + 0.30])
         if self._cam_eye is None:
             self._cam_eye = desired_eye; self._cam_tgt = desired_tgt
@@ -931,6 +942,80 @@ class RealQuadEnv:
             gymapi.Vec3(*self._cam_eye.tolist()),
             gymapi.Vec3(*self._cam_tgt.tolist()),
         )
+
+    def create_recording_camera(self, width: int = 1280, height: int = 720, follow: bool = True):
+        """Create an Isaac Gym camera sensor for off-screen video capture."""
+        cam_props = gymapi.CameraProperties()
+        cam_props.width = int(width)
+        cam_props.height = int(height)
+        cam_props.enable_tensors = False
+
+        self.record_camera = self.gym.create_camera_sensor(self.envs[0], cam_props)
+        if self.record_camera == -1:
+            raise RuntimeError("Failed to create Isaac Gym recording camera sensor.")
+
+        self.record_camera_width = int(width)
+        self.record_camera_height = int(height)
+        self.record_camera_follow = bool(follow)
+        self._record_cam_eye = None
+        self._record_cam_tgt = None
+        self._update_recording_camera()
+
+    def _update_recording_camera(self):
+        if self.record_camera is None:
+            return
+
+        if self.record_camera_follow:
+            px, py, pz = [float(v) for v in self.base_pos[0, :3]]
+            yaw = self._yaw_from_quat()
+            # back = np.array([-math.cos(yaw), -math.sin(yaw), 0.0])
+            # desired_eye = np.array([px, py, pz]) + self.cam_dist * back + self.cam_height * np.array([0.0, 0.0, 1.0])
+            side = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
+            # desired_eye = np.array([px, py, pz]) + self.cam_dist * back + self.cam_height * up
+            desired_eye = np.array([px, py, pz]) + self.cam_dist * side + self.cam_height  * np.array([0.0, 0.0, 1.0])
+            desired_tgt = np.array([px, py, pz + 0.30])
+
+            if self._record_cam_eye is None:
+                self._record_cam_eye = desired_eye
+                self._record_cam_tgt = desired_tgt
+            else:
+                a = float(self.cam_smooth)
+                self._record_cam_eye = (1 - a) * self._record_cam_eye + a * desired_eye
+                self._record_cam_tgt = (1 - a) * self._record_cam_tgt + a * desired_tgt
+
+            eye = self._record_cam_eye
+            target = self._record_cam_tgt
+        else:
+            eye = np.array([2.0, 2.0, 1.2])
+            target = np.array([0.0, 0.0, 0.3])
+
+        self.gym.set_camera_location(
+            self.record_camera,
+            self.envs[0],
+            gymapi.Vec3(*eye.tolist()),
+            gymapi.Vec3(*target.tolist()),
+        )
+
+    def capture_recording_frame(self):
+        if self.record_camera is None:
+            raise RuntimeError("Recording camera has not been created.")
+
+        self.gym.step_graphics(self.sim)
+        self._update_recording_camera()
+        self.gym.render_all_camera_sensors(self.sim)
+
+        image = self.gym.get_camera_image(
+            self.sim,
+            self.envs[0],
+            self.record_camera,
+            gymapi.IMAGE_COLOR,
+        )
+        frame = np.asarray(image, dtype=np.uint8).reshape(
+            self.record_camera_height,
+            self.record_camera_width,
+            4,
+        )
+        return np.ascontiguousarray(frame[:, :, :3])
 
     # ---------------- helpers / sensors ----------------
     @torch.no_grad()

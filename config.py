@@ -107,7 +107,7 @@ class EnvCfg:
     use_strict_alpha_align: bool = True
 
     # termination
-    term_penalty: float = 200.0
+    term_penalty: float = 0
 
     #============================================
     # Random velocity command switch - True: on; False: off (fixed 0.2 m/s)
@@ -132,7 +132,7 @@ class EnvCfg:
     fz_max: float = 250.0
 
     # Number of parallel environments = number of parallel robots
-    num_envs: int = 16
+    num_envs: int = 4096
 
     cmd_deadzone: float = 0.05   # m/s, threshold for “stop”
 
