@@ -431,12 +431,12 @@ def train(num_iters=1000, steps_per_iter=24,
     plt.tight_layout(); plt.savefig(out("loss_curve_srbd_align.png"))
 
     loss_parts = {
-        "loss_v":     np.array(loss_v_hist_iter,     dtype=np.float32),
-        "loss_h":     np.array(loss_h_hist_iter,     dtype=np.float32),
-        "loss_omega": np.array(loss_omega_hist_iter, dtype=np.float32),
-        "loss_ctrl":  np.array(loss_ctrl_hist_iter,  dtype=np.float32),
-        "loss_gproj": np.array(loss_gproj_hist_iter, dtype=np.float32),
-        "loss_foot":  np.array(loss_foot_hist_iter,  dtype=np.float32),
+        "loss_v":     a1 * np.array(loss_v_hist_iter,     dtype=np.float32),
+        "loss_h":     a2 * np.array(loss_h_hist_iter,     dtype=np.float32),
+        "loss_omega": a3 * np.array(loss_omega_hist_iter, dtype=np.float32),
+        "loss_ctrl":  a4 * np.array(loss_ctrl_hist_iter,  dtype=np.float32),
+        "loss_gproj": a5 * np.array(loss_gproj_hist_iter, dtype=np.float32),
+        "loss_foot":  a6 * np.array(loss_foot_hist_iter,  dtype=np.float32),
     }
 
     for name, arr in loss_parts.items():
@@ -486,4 +486,3 @@ def train(num_iters=1000, steps_per_iter=24,
     
 if __name__ == "__main__":
     train(num_iters=1000, steps_per_iter=24, seed=0)
-
